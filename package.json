@@ -1,0 +1,23 @@
+{
+  "name": "grand-elephants-api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sell On App (Grand Elephants) marketplace backend - Cloudflare Worker + D1 + Lipila + Africa's Talking + ZRA SmartInvoice-ready",
+  "scripts": {
+    "dev": "wrangler dev --test-scheduled",
+    "db:init": "wrangler d1 execute grand-elephants-db --local --file=./sql/schema.sql",
+    "db:remote": "wrangler d1 execute grand-elephants-db --remote --file=./sql/schema.sql",
+    "db:seed": "wrangler d1 execute grand-elephants-db --remote --file=./sql/seed.sql",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "firebase-admin": "^14.2.0",
+    "hono": "^4.6.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260730.1",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.118.0"
+  }
+}

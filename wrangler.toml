@@ -1,0 +1,50 @@
+name = "grand-elephants-api"
+main = "src/index.ts"
+compatibility_date = "2026-01-01"
+workers_dev = true
+compatibility_flags = ["nodejs_compat"]
+
+# Daily at 08:00 CAT (06:00 UTC): finalize pending Lipila disbursements via status checks.
+[triggers]
+crons = ["0 6 * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "grand-elephants-db"
+database_id = "447d1f6c-1b73-4bfd-bea5-3747460acdfc"
+
+# Website: Grand Elephants / Sell On App Flutter web build. Served by the Worker
+# as a fallback; client-side routes fall back to index.html (SPA). Same worker
+# URL serves both the JSON API (/api/*) and the website (everything else).
+[assets]
+directory = "../grand-elephants-flutter/build/web"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+# Secrets (set with `npx wrangler secret put NAME` - NEVER commit):
+#   AT_API_KEY            - Africa's Talking API key (secret - never commit)
+#   JWT_SECRET            - random string for signing user tokens
+#   LIPILA_API_KEY        - Lipila live/secret key (lsk_/lpk_) - Grand Elephants merchant wallet
+#   LIPILA_WEBHOOK_SECRET - shared secret Lipila sends with webhook callbacks
+#   SUPERADMIN_PHONES     - comma-separated superadmin phone numbers (E.164, e.g. +260977123456)
+#   FIREBASE_CLIENT_EMAIL - Firebase service-account client email (FCM push)
+#   FIREBASE_PRIVATE_KEY  - Firebase service-account private key (FCM push)
+#   ZRA_API_KEY           - ZRA SmartInvoice API key (optional; blank until ZRA onboarding)
+
+[vars]
+ENV = "production"              # "sandbox" logs SMS + returns OTP debug codes; "production" sends real AT SMS + Lipila money
+AT_USERNAME = "ChurchOnApp"     # Africa's Talking app username (used in the AT API call)
+AT_FROM = "SELLONAPP"           # approved AT sender ID - used for ALL SMS (OTP + notifications)
+LIPILA_ENV = "production"       # Lipila gateway: "sandbox" (api.lipila.dev) or "production" (api.lipila.io, real money)
+APP_URL = "https://grand-elephants-api.godfreymoseskalambo.workers.dev"
+FIREBASE_PROJECT_ID = "sell-on-app"
+CORS_ORIGINS = "https://grand-elephants-api.godfreymoseskalambo.workers.dev"
+# Fees (cents / percent - see src/fees.ts)
+PLATFORM_COMMISSION_PCT = "15"    # marketplace commission per order (business pays)
+DELIVERY_BASE_FEE_CENTS = "2500"  # K25 base delivery fee
+DELIVERY_PER_KM_CENTS = "1000"    # K10 per km
+VAT_PCT = "16"                    # ZRA VAT on goods
+LIPILA_COLLECTION_FEE_PCT = "2.5" # Lipila MoMo collection fee (%) - customer pays
+LIPILA_DISBURSEMENT_FEE_PCT = "1.5" # Lipila MoMo disbursement fee (%), deducted at payout
+CARD_LIPILA_COLLECTION_FEE_PCT = "2.5" # Lipila card collection fee (%), customer pays
+OTP_TTL_MINUTES = "5"
