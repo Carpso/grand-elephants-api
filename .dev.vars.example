@@ -1,0 +1,21 @@
+# Local development secrets for grand-elephants-api.
+# Copy to `.dev.vars` and fill in real values. NEVER commit `.dev.vars`.
+#
+# For production, set these with:
+#   npx wrangler secret put AT_API_KEY
+#   npx wrangler secret put JWT_SECRET
+#   npx wrangler secret put LIPILA_API_KEY
+#   npx wrangler secret put LIPILA_WEBHOOK_SECRET
+#   npx wrangler secret put SUPERADMIN_PHONES
+#   npx wrangler secret put FIREBASE_CLIENT_EMAIL
+#   npx wrangler secret put FIREBASE_PRIVATE_KEY
+#   npx wrangler secret put ZRA_API_KEY
+
+AT_API_KEY=
+JWT_SECRET=
+LIPILA_API_KEY=
+LIPILA_WEBHOOK_SECRET=
+SUPERADMIN_PHONES=
+FIREBASE_CLIENT_EMAIL=
+FIREBASE_PRIVATE_KEY=
+ZRA_API_KEY=
