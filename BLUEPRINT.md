@@ -75,6 +75,21 @@ npx wrangler d1 execute grand-elephants-db --remote --file=./sql/schema.sql
 npx wrangler d1 execute grand-elephants-db --remote --file=./sql/seed.sql
 ```
 
+## SMS (Africa's Talking)
+
+Production live: `api.africastalking.com`, username `ChurchOnApp`, approved
+sender ID **`Carpso`**, brand prefix `GRANDELEPHANTS:`. Templates in
+`src/messages.ts` (OTP, order, rider, payout, invoice) — the OTP string is inlined
+in `src/auth.ts`.
+
+- Secret: `AT_API_KEY` (production key — AT dashboard → Settings → API Key).
+- Vars: `AT_USERNAME`, `AT_FROM`, `AT_SANDBOX`.
+- `AT_SANDBOX="true"` flips `src/sms.ts` to the sandbox host + username
+  `sandbox` (keys are environment-specific; a 401 "authentication is invalid"
+  = key/host mismatch).
+- `ENV` must be `production` for real sends; otherwise SMS is logged only and
+  OTP responses include a `debugCode`.
+
 ## Secrets (NEVER commit)
 
 See `.dev.vars.example`. Production secrets via `npx wrangler secret put`:
@@ -96,4 +111,5 @@ npx wrangler deploy   # deploy only (website already built)
 ```
 npx wrangler dev --test-scheduled
 # ENV=sandbox (default) logs SMS + returns debug OTP codes; no real money.
+# Production worker runs ENV=production (real AT SMS + real Lipila money).
 ```

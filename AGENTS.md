@@ -27,6 +27,23 @@ Guidance for AI coding agents working in this repository.
 - Keep `src/index.ts` Hono routes grouped by concern (auth, catalog, orders,
   business, riders, admin, webhooks, cron).
 
+## SMS (Africa's Talking)
+
+- Live on the **production** API: `api.africastalking.com`, username
+  `ChurchOnApp`, sender ID **`Carpso`** (approved). All SMS are branded
+  `GRANDELEPHANTS: …` (`src/messages.ts` + the OTP string in `src/auth.ts`).
+- `AT_API_KEY` is a secret (production key from the AT dashboard —
+  `Settings → API Key`). `AT_USERNAME`/`AT_FROM`/`AT_SANDBOX` are `[vars]`.
+- `AT_SANDBOX = "true"` switches `src/sms.ts` to
+  `api.sandbox.africastalking.com` with username `sandbox` (sandbox keys are
+  rejected by the production host and vice versa — a 401
+  "The supplied authentication is invalid" almost always means
+  key/environment mismatch).
+- `ENV=production` is required for SMS to actually send; otherwise messages
+  are only logged. OTP debug codes are returned only when `ENV != production`.
+- If AT rejects the sender ID (400), `sendSms` retries once without `from`
+  so OTPs keep flowing.
+
 ## Repository layout
 
 - `src/index.ts` — all routes + cron
