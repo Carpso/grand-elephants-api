@@ -37,7 +37,7 @@ AT_USERNAME = "ChurchOnApp"     # Africa's Talking app username (used in the AT 
 AT_FROM = "SELLONAPP"           # approved AT sender ID - used for ALL SMS (OTP + notifications)
 LIPILA_ENV = "production"       # Lipila gateway: "sandbox" (api.lipila.dev) or "production" (api.lipila.io, real money)
 APP_URL = "https://grand-elephants-api.godfreymoseskalambo.workers.dev"
-FIREBASE_PROJECT_ID = "sell-on-app"
+FIREBASE_PROJECT_ID = "grand-elephants-b8ec4"
 CORS_ORIGINS = "https://grand-elephants-api.godfreymoseskalambo.workers.dev"
 # Fees (cents / percent - see src/fees.ts)
 PLATFORM_COMMISSION_PCT = "15"    # marketplace commission per order (business pays)
