@@ -1,4 +1,4 @@
--- Grand Elephants / Sell On App marketplace schema (D1 / SQLite)
+-- Grand Elephants marketplace schema (D1 / SQLite)
 -- All money stored as INTEGER cents (ZMW). Prices/totals are cents.
 
 DROP TABLE IF EXISTS reviews;

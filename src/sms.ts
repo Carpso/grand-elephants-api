@@ -4,10 +4,12 @@ export interface SmsEnv {
   AT_USERNAME: string;
   AT_API_KEY: string;
   AT_FROM?: string;
+  AT_SANDBOX?: string;
   ENV: string;
 }
 
 const AT_MESSAGES_URL = "https://api.africastalking.com/version1/messaging";
+const AT_SANDBOX_URL = "https://api.sandbox.africastalking.com/version1/messaging";
 
 /** Africa's Talking requires E.164, no leading 0. Assumes +260 Zambian numbers. */
 export function safePhone(phone: string): string {
@@ -31,14 +33,16 @@ export async function sendSms(env: SmsEnv, phone: string, message: string): Prom
     return;
   }
 
+  // Sandbox API keys only work against the sandbox host with username "sandbox".
+  const sandbox = !!env.AT_SANDBOX && env.AT_SANDBOX !== "false" && env.AT_SANDBOX !== "0";
   const send = async (from?: string) => {
     const form = new URLSearchParams({
-      username: env.AT_USERNAME,
+      username: sandbox ? "sandbox" : env.AT_USERNAME,
       to: safePhone(phone),
       message: message,
-      ...(from ? { from } : {}),
+      ...(from && !sandbox ? { from } : {}),
     });
-    const res = await fetch(AT_MESSAGES_URL, {
+    const res = await fetch(sandbox ? AT_SANDBOX_URL : AT_MESSAGES_URL, {
       method: "POST",
       headers: {
         Apikey: env.AT_API_KEY,

@@ -167,7 +167,7 @@ export async function createCardCollection(
         accountNumber: params.customerInfo.email,
         currency: "ZMW",
         backUrl: params.backUrl ?? "",
-        referenceData: sanitizeNarration(params.referenceData ?? `Sell On App order ${params.referenceId}`),
+        referenceData: sanitizeNarration(params.referenceData ?? `Grand Elephants order ${params.referenceId}`),
       },
     },
     params.callbackUrl

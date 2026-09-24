@@ -33,7 +33,7 @@ export async function requestOtp(db: D1Database, env: AuthEnv, phone: string): P
 
   // Cooldown: one valid code per phone at a time (older ones now ignored on verify).
   try {
-    await sendSms(env, phone, `SELLONAPP: Your Sell On App verification code is ${code}. It expires in ${ttlMinutes} minutes. Do not share it.`);
+    await sendSms(env, phone, `GRANDELEPHANTS: Your Grand Elephants verification code is ${code}. It expires in ${ttlMinutes} minutes. Do not share it.`);
   } catch (e) {
     console.error("OTP SMS failed:", e);
   }

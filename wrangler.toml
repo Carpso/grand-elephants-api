@@ -13,7 +13,7 @@ binding = "DB"
 database_name = "grand-elephants-db"
 database_id = "447d1f6c-1b73-4bfd-bea5-3747460acdfc"
 
-# Website: Grand Elephants / Sell On App Flutter web build. Served by the Worker
+# Website: Grand Elephants Flutter web build. Served by the Worker
 # as a fallback; client-side routes fall back to index.html (SPA). Same worker
 # URL serves both the JSON API (/api/*) and the website (everything else).
 [assets]
@@ -35,6 +35,7 @@ not_found_handling = "single-page-application"
 ENV = "production"              # "sandbox" logs SMS + returns OTP debug codes; "production" sends real AT SMS + Lipila money
 AT_USERNAME = "ChurchOnApp"     # Africa's Talking app username (used in the AT API call)
 AT_FROM = "Carpso"              # approved AT sender ID - used for ALL SMS (OTP + notifications)
+AT_SANDBOX = "true"             # AT sandbox key -> api.sandbox.africastalking.com, username "sandbox"
 LIPILA_ENV = "production"       # Lipila gateway: "sandbox" (api.lipila.dev) or "production" (api.lipila.io, real money)
 APP_URL = "https://grand-elephants-api.godfreymoseskalambo.workers.dev"
 FIREBASE_PROJECT_ID = "grand-elephants-b8ec4"

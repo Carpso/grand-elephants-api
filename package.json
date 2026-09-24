@@ -2,7 +2,7 @@
   "name": "grand-elephants-api",
   "version": "0.1.0",
   "private": true,
-  "description": "Sell On App (Grand Elephants) marketplace backend - Cloudflare Worker + D1 + Lipila + Africa's Talking + ZRA SmartInvoice-ready",
+  "description": "Grand Elephants marketplace backend - Cloudflare Worker + D1 + Lipila + Africa's Talking + ZRA SmartInvoice-ready",
   "scripts": {
     "dev": "wrangler dev --test-scheduled",
     "db:init": "wrangler d1 execute grand-elephants-db --local --file=./sql/schema.sql",

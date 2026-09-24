@@ -1,4 +1,4 @@
-# Deploy the Grand Elephants / Sell On App website + API.
+# Deploy the Grand Elephants website + API.
 # Requires: Cloudflare login (`npx wrangler login`) OR CLOUDFLARE_API_TOKEN set.
 # Secrets must be set first (see .dev.vars.example). Run from this directory.
 

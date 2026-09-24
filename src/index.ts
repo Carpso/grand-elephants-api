@@ -1,4 +1,4 @@
-// Grand Elephants / Sell On App marketplace backend.
+// Grand Elephants marketplace backend.
 // Cloudflare Worker + D1 + Lipila (server-side payments) + Africa's Talking SMS + FCM push.
 import { Hono } from "hono";
 import { cors } from "hono/cors";
@@ -413,7 +413,7 @@ app.post("/api/orders", async (c) => {
           firstName: (a.user.name || "Sell On").split(" ")[0],
           lastName: a.user.name?.split(" ").slice(1).join(" ") || "App",
           phoneNumber: a.user.phone,
-          email: a.user.email || `${a.id}@sellonapp.app`,
+          email: a.user.email || `${a.id}@grandelephants.app`,
         },
         backUrl: "",
       }, c.env.DB);

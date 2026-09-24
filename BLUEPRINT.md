@@ -1,4 +1,4 @@
-# Grand Elephants / Sell On App — Backend Blueprint
+# Grand Elephants — Backend Blueprint
 
 Cloudflare Worker + D1 + Lipila + Africa's Talking SMS + FCM push powering the
 Grand Elephants luxury marketplace (Flutter app + website on the same worker URL).
