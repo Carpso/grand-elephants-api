@@ -1,9 +1,8 @@
-// Marketplace categories (sync with lib/models in the Flutter app).
+// Marketplace categories (bags-only marketplace; sync with sql/seed.sql).
 
 export const MARKETPLACE_CATEGORIES = [
-  "Bags", "Shoes", "Jewelry", "Dresses", "Electronics", "Groceries",
-  "Fashion", "Home & Living", "Accessories", "Beauty", "Sports",
-  "Toys & Kids", "Books", "Phones & Tablets", "Computers",
+  "Tote Bags", "Backpacks", "Handbags", "Crossbody Bags", "Clutches",
+  "Laptop Bags", "Duffel & Travel Bags", "Waist Bags", "Shopping Bags", "Baby Bags",
 ] as const;
 
 export function isValidCategory(name: string): boolean {

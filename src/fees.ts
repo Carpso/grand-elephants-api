@@ -33,6 +33,58 @@ export function parseSettings(raw: Record<string, string | undefined>): FeeSetti
   };
 }
 
+/** app_settings key -> env var name (the admin Finance screen PATCHes these keys). */
+const DB_FEE_KEYS: Record<string, string> = {
+  vat_pct: "VAT_PCT",
+  platform_commission_pct: "PLATFORM_COMMISSION_PCT",
+  delivery_base_fee_cents: "DELIVERY_BASE_FEE_CENTS",
+  delivery_per_km_cents: "DELIVERY_PER_KM_CENTS",
+  lipila_collection_fee_pct: "LIPILA_COLLECTION_FEE_PCT",
+  lipila_disbursement_fee_pct: "LIPILA_DISBURSEMENT_FEE_PCT",
+  card_lipila_collection_fee_pct: "CARD_LIPILA_COLLECTION_FEE_PCT",
+};
+
+interface FeeSettingsCache {
+  at: number;
+  overrides: Record<string, string>;
+}
+
+const FEE_CACHE_KEY = "__geFeeSettingsCache";
+const FEE_CACHE_TTL_MS = 60_000;
+
+/** DB overrides for fee keys, cached ~60s on globalThis (per isolate). */
+async function loadFeeOverrides(db: D1Database): Promise<Record<string, string>> {
+  const g = globalThis as unknown as Record<string, FeeSettingsCache | undefined>;
+  const cached = g[FEE_CACHE_KEY];
+  if (cached && Date.now() - cached.at < FEE_CACHE_TTL_MS) return cached.overrides;
+  try {
+    const rows = await db.prepare("SELECT key, value FROM app_settings").all<{ key: string; value: string }>();
+    const overrides: Record<string, string> = {};
+    for (const r of rows.results ?? []) {
+      const envKey = DB_FEE_KEYS[r.key];
+      if (envKey && r.value !== undefined && r.value !== null) overrides[envKey] = String(r.value);
+    }
+    g[FEE_CACHE_KEY] = { at: Date.now(), overrides };
+    return overrides;
+  } catch {
+    // D1 unavailable: keep serving the last known overrides (or env-only).
+    return cached?.overrides ?? {};
+  }
+}
+
+/** Drop the cached app_settings fee overrides (call after PATCH /api/admin/settings). */
+export function invalidateFeeSettings(): void {
+  const g = globalThis as unknown as Record<string, FeeSettingsCache | undefined>;
+  const cached = g[FEE_CACHE_KEY];
+  if (cached) cached.at = 0;
+}
+
+/** Fee settings from D1 `app_settings` when present, falling back to env vars. */
+export async function loadFeeSettings(db: D1Database, raw: Record<string, string | undefined>): Promise<FeeSettings> {
+  const overrides = await loadFeeOverrides(db);
+  return parseSettings({ ...raw, ...overrides });
+}
+
 /** Delivery fee for a distance in km. K25 base + K10/km, 0 when distance is 0. */
 export function deliveryFeeCents(feeSettings: Pick<FeeSettings, "deliveryBaseFeeCents" | "deliveryPerKmCents">, km: number): number {
   if (!km || km <= 0) return 0;

@@ -2,6 +2,7 @@
 -- All money stored as INTEGER cents (ZMW). Prices/totals are cents.
 
 DROP TABLE IF EXISTS reviews;
+DROP TABLE IF EXISTS tax_payments;
 DROP TABLE IF EXISTS rider_payouts;
 DROP TABLE IF EXISTS lipila_logs;
 DROP TABLE IF EXISTS admin_actions;
@@ -33,7 +34,7 @@ CREATE TABLE users (
   phone TEXT UNIQUE NOT NULL,               -- E.164, e.g. +260977123456
   password_hash TEXT,                       -- optional (admin/staff web login)
   role TEXT NOT NULL DEFAULT 'user',        -- user | rider | business | employee | admin | superadmin
-  rider_status TEXT NOT NULL DEFAULT 'none',-- none | pending | approved
+  rider_status TEXT NOT NULL DEFAULT 'none',-- none | pending | approved | rejected
   rider_lat REAL,
   rider_lng REAL,
   rider_address TEXT,
@@ -133,8 +134,10 @@ CREATE TABLE orders (
   delivery_method TEXT NOT NULL DEFAULT 'standard',
   customer_phone TEXT,
   notes TEXT,
+  buyer_tpin TEXT,                           -- buyer ZRA TPIN (10 digits), optional
   rider_id INTEGER REFERENCES riders(id),
   assigned_at TEXT,
+  proof_photo TEXT,                          -- rider proof-of-delivery photo (data URL or path)
   delivered_at TEXT,
   cancelled_at TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -166,6 +169,7 @@ CREATE TABLE riders (
   status TEXT NOT NULL DEFAULT 'pending',   -- pending | approved | suspended
   balance_cents INTEGER NOT NULL DEFAULT 0, -- delivery earnings (ZMW cents)
   joined TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(user_id, business_id)
 );
 CREATE INDEX idx_riders_business ON riders(business_id);
@@ -207,7 +211,8 @@ CREATE TABLE invoices (
   order_id TEXT NOT NULL REFERENCES orders(id),
   business_id INTEGER NOT NULL REFERENCES businesses(id),
   customer_id INTEGER NOT NULL REFERENCES users(id),
-  tp_in TEXT,                               -- business TPIN
+  tp_in TEXT,                               -- business (seller) TPIN
+  buyer_tpin TEXT,                           -- buyer ZRA TPIN (SmartInvoice buyer field)
   afc_code TEXT,                            -- ZRA AFC (Tax Invoice) code (filled on ZRA sync)
   acf_code TEXT,                            -- ZRA ACF (self-billing) code
   zra_qr TEXT,                              -- ZRA QR payload
@@ -336,3 +341,17 @@ CREATE TABLE rider_payouts (
 );
 CREATE INDEX idx_rider_payouts_rider ON rider_payouts(rider_id);
 CREATE INDEX idx_rider_payouts_business ON rider_payouts(business_id);
+
+-- VAT returns recorded by a business owner (proof of payment to ZRA).
+CREATE TABLE tax_payments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  business_id INTEGER NOT NULL REFERENCES businesses(id),
+  period_start TEXT NOT NULL,               -- YYYY-MM-DD
+  period_end TEXT NOT NULL,                 -- YYYY-MM-DD
+  amount_cents INTEGER NOT NULL,
+  reference TEXT NOT NULL DEFAULT '',       -- ZRA / payment reference
+  method TEXT NOT NULL DEFAULT '',          -- mtn | airtel | zamtel | cash | bank
+  created_by INTEGER REFERENCES users(id),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_tax_payments_business ON tax_payments(business_id);

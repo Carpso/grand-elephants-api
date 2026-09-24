@@ -1,16 +1,18 @@
 // Grand Elephants marketplace backend.
 // Cloudflare Worker + D1 + Lipila (server-side payments) + Africa's Talking SMS + FCM push.
 import { Hono } from "hono";
+import type { Context } from "hono";
 import { cors } from "hono/cors";
 import {
   createCollection, createCardCollection, createDisbursement,
   checkDisbursementStatus, checkWalletBalance, LipilaEnv,
 } from "./lipila";
-import { parseSettings, computeOrderTotals, payoutNetCents, FeeSettings } from "./fees";
+import { parseSettings, computeOrderTotals, payoutNetCents, loadFeeSettings, invalidateFeeSettings, FeeSettings } from "./fees";
 import { requestOtp, verifyOtp, issueToken, authFromRequest, isSuperadminPhone, hasRole, userJson, AuthEnv } from "./auth";
 import { sendSms } from "./sms";
 import { pushUser, pushAdmins, pushAllUsers, FirebaseEnv } from "./firebase";
 import { nextInvoiceNo, syncInvoiceToZra } from "./invoice";
+import { submitInvoice, SmartInvoiceSubmission } from "./smart_invoice";
 import { isValidCategory } from "./categories";
 import { randomHex, sha256Hex } from "./jwt";
 import * as msg from "./messages";
@@ -32,6 +34,9 @@ type Env = AuthEnv &
   };
 
 const app = new Hono<{ Bindings: Env }>();
+
+/** Handler context for routes extracted into named functions. */
+type Ctx = Context<{ Bindings: Env }>;
 
 app.use("*", cors({ origin: "*", allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], allowHeaders: ["Content-Type", "Authorization"] }));
 
@@ -69,14 +74,57 @@ async function canManageBusiness(db: D1Database, userId: number, businessId: num
   return !!member;
 }
 
-async function feesOf(env: Env, db: D1Database, businessId?: number): Promise<{ feeSettings: FeeSettings; commissionPct: number }> {
-  const feeSettings = parseSettings({
+/**
+ * Platform business used when an admin acts without a business_id:
+ * the seeded/"Grand Elephants" business, else any approved one, else the first
+ * row, else a freshly created "Grand Elephants" business owned by the admin.
+ */
+async function resolveDefaultBusiness(db: D1Database, adminUserId: number): Promise<number> {
+  const seeded = await db.prepare("SELECT id FROM businesses WHERE name LIKE 'Grand Elephants%' ORDER BY id LIMIT 1").first<any>();
+  if (seeded) return Number(seeded.id);
+  const approved = await db.prepare("SELECT id FROM businesses WHERE status = 'approved' ORDER BY id LIMIT 1").first<any>();
+  if (approved) return Number(approved.id);
+  const first = await db.prepare("SELECT id FROM businesses ORDER BY id LIMIT 1").first<any>();
+  if (first) return Number(first.id);
+  const r = await db.prepare(
+    "INSERT INTO businesses (owner_user_id, name, slogan, description, address, status) VALUES (?, 'Grand Elephants', '', '', '', 'approved')"
+  ).bind(adminUserId).run();
+  const newId = Number(r.meta.last_row_id);
+  await db.prepare("INSERT OR IGNORE INTO wallets (business_id, balance_cents, held_cents) VALUES (?, 0, 0)").bind(newId).run();
+  return newId;
+}
+
+/**
+ * Business scope for the `/api/businesses/me/products*` routes.
+ * Returns the business id to operate on, or null when the caller may not.
+ * Admins/superadmins are always allowed (own business, explicit businessId,
+ * or the default platform business).
+ */
+async function businessScope(db: D1Database, a: { id: number; user: any }, req: any = {}): Promise<number | null> {
+  const isAdmin = hasRole(a.user, "admin", "superadmin");
+  if (isAdmin && req.businessId !== undefined && req.businessId !== null && req.businessId !== "") {
+    const id = Number(req.businessId);
+    const biz = Number.isInteger(id) && id > 0 ? await getBusiness(db, id) : null;
+    return biz ? Number(biz.id) : null;
+  }
+  if (a.user.business_id) return Number(a.user.business_id);
+  if (isAdmin) return resolveDefaultBusiness(db, a.id);
+  return null;
+}
+
+/** Env vars read as fee fallbacks by `loadFeeSettings` (DB app_settings win). */
+function feeEnvRaw(env: Env): Record<string, string | undefined> {
+  return {
     VAT_PCT: env.VAT_PCT, PLATFORM_COMMISSION_PCT: env.PLATFORM_COMMISSION_PCT,
     DELIVERY_BASE_FEE_CENTS: env.DELIVERY_BASE_FEE_CENTS, DELIVERY_PER_KM_CENTS: env.DELIVERY_PER_KM_CENTS,
     LIPILA_COLLECTION_FEE_PCT: env.LIPILA_COLLECTION_FEE_PCT,
     LIPILA_DISBURSEMENT_FEE_PCT: env.LIPILA_DISBURSEMENT_FEE_PCT,
     CARD_LIPILA_COLLECTION_FEE_PCT: env.CARD_LIPILA_COLLECTION_FEE_PCT,
-  });
+  };
+}
+
+async function feesOf(env: Env, db: D1Database, businessId?: number): Promise<{ feeSettings: FeeSettings; commissionPct: number }> {
+  const feeSettings = await loadFeeSettings(db, feeEnvRaw(env));
   let commissionPct = feeSettings.commissionPct;
   if (businessId) {
     const b = await getBusiness(db, businessId);
@@ -108,11 +156,12 @@ async function orderJson(db: D1Database, row: any): Promise<Record<string, unkno
     .prepare("SELECT id, product_id, name, price_cents, image, quantity FROM order_items WHERE order_id = ?")
     .bind(row.id)
     .all<any>();
-  const biz = row.business_name ? null : await getBusiness(db, row.business_id);
+  const biz = await db.prepare("SELECT name, address, tpin FROM businesses WHERE id = ?").bind(row.business_id).first<any>();
   const rider = row.rider_id ? await db.prepare("SELECT id, name, phone, vehicle FROM riders WHERE id = ?").bind(row.rider_id).first<any>() : null;
   const invoice = await db.prepare("SELECT invoice_no, status FROM invoices WHERE order_id = ?").bind(row.id).first<any>();
   return {
     id: row.id,
+    orderNumber: row.id,
     items: (items.results ?? []).map((it) => ({
       id: String(it.product_id ?? it.id),
       name: it.name,
@@ -120,6 +169,7 @@ async function orderJson(db: D1Database, row: any): Promise<Record<string, unkno
       priceCents: it.price_cents,
       image: it.image ?? "",
       quantity: it.quantity,
+      lineTotalCents: it.price_cents * it.quantity,
     })),
     subtotal: row.subtotal_cents / 100,
     subtotalCents: row.subtotal_cents,
@@ -140,11 +190,15 @@ async function orderJson(db: D1Database, row: any): Promise<Record<string, unkno
     notes: row.notes ?? "",
     businessId: String(row.business_id),
     businessName: row.business_name ?? biz?.name ?? "",
+    businessAddress: biz?.address ?? "",
+    businessTpin: biz?.tpin ?? "",
+    buyerTpin: row.buyer_tpin ?? "",
     riderId: row.rider_id ? String(row.rider_id) : null,
     riderName: rider?.name ?? "",
     riderVehicle: rider?.vehicle ?? "",
     invoiceNo: invoice?.invoice_no ?? null,
     invoiceStatus: invoice?.status ?? null,
+    proofPhoto: row.proof_photo ?? "",
     deliveredAt: row.delivered_at,
     createdAt: row.created_at,
   };
@@ -170,7 +224,8 @@ async function confirmOrder(db: D1Database, env: Env, orderId: string, transacti
   if (order.payment_status === "successful") return { ok: true, already: true };
 
   const biz = await getBusiness(db, order.business_id);
-  const commissionPct = biz?.commission_pct != null ? Number(biz.commission_pct) : Number(env.PLATFORM_COMMISSION_PCT ?? "15");
+  const feeSettings = await loadFeeSettings(db, feeEnvRaw(env));
+  const commissionPct = biz?.commission_pct != null ? Number(biz.commission_pct) : feeSettings.commissionPct;
   const goodsShare = order.subtotal_cents - Math.round(order.subtotal_cents * (commissionPct / 100));
 
   await db.batch([
@@ -184,17 +239,37 @@ async function confirmOrder(db: D1Database, env: Env, orderId: string, transacti
   // Invoice (ZRA-ready)
   const invoiceNo = await nextInvoiceNo(db);
   const inv = await db.prepare(
-    `INSERT INTO invoices (invoice_no, order_id, business_id, customer_id, tp_in, status, subtotal_cents, vat_cents, total_cents)
-     VALUES (?, ?, ?, ?, ?, 'issued', ?, ?, ?)`
-  ).bind(invoiceNo, orderId, order.business_id, order.user_id, null, order.subtotal_cents, order.vat_cents, order.total_cents).run();
+    `INSERT INTO invoices (invoice_no, order_id, business_id, customer_id, tp_in, buyer_tpin, status, subtotal_cents, vat_cents, total_cents)
+     VALUES (?, ?, ?, ?, ?, ?, 'issued', ?, ?, ?)`
+  ).bind(invoiceNo, orderId, order.business_id, order.user_id, null, order.buyer_tpin ?? null,
+    order.subtotal_cents, order.vat_cents, order.total_cents).run();
   const lines = await db.prepare("SELECT name, price_cents, quantity FROM order_items WHERE order_id = ?").bind(orderId).all<any>();
   for (const l of lines.results ?? []) {
     await db.prepare("INSERT INTO invoice_items (invoice_id, name, price_cents, quantity, vat_pct) VALUES (?, ?, ?, ?, ?)")
-      .bind(inv.meta.last_row_id, l.name, l.price_cents, l.quantity, 16).run();
+      .bind(inv.meta.last_row_id, l.name, l.price_cents, l.quantity, feeSettings.vatPct).run();
   }
   if (biz?.tpin) {
     await db.prepare("UPDATE invoices SET tp_in = ? WHERE id = ?").bind(biz.tpin, inv.meta.last_row_id).run();
     await syncInvoiceToZra(db, env, inv.meta.last_row_id);
+  }
+
+  // ZRA SmartInvoice submission seam (no-op stub until credentials exist).
+  try {
+    const submission: SmartInvoiceSubmission = {
+      invoiceId: Number(inv.meta.last_row_id),
+      invoiceNo,
+      orderId,
+      businessId: order.business_id,
+      buyerTpin: order.buyer_tpin ?? "",
+      sellerTpin: biz?.tpin ?? "",
+      subtotalCents: order.subtotal_cents,
+      vatCents: order.vat_cents,
+      totalCents: order.total_cents,
+      issuedAt: order.created_at ?? new Date().toISOString(),
+    };
+    await submitInvoice(env, submission);
+  } catch (e) {
+    console.error("smart_invoice submission failed:", e);
   }
 
   const bizName = biz?.name ?? "your shop";
@@ -212,6 +287,8 @@ async function confirmOrder(db: D1Database, env: Env, orderId: string, transacti
 // ---------- health ----------
 
 app.get("/health", (c) => json(c, { ok: true, service: "grand-elephants-api", time: new Date().toISOString() }));
+// Alias: the Flutter app polls /api/health (system health modal).
+app.get("/api/health", (c) => json(c, { ok: true, service: "grand-elephants-api", time: new Date().toISOString() }));
 
 // ---------- auth ----------
 
@@ -286,6 +363,35 @@ app.patch("/api/me", async (c) => {
   return json(c, { user: userJson(user) });
 });
 
+// Employee / business dashboard stats (any authenticated user).
+
+app.get("/api/employee/stats", async (c) => {
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
+  if (!a) return unauthorized(c);
+  const own = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM orders WHERE user_id = ?").bind(a.id).first<any>();
+  const ownOrders = Number(own?.n ?? 0);
+  if (!a.user.business_id) {
+    return json(c, { salesTodayCents: 0, salesTotalCents: 0, ordersToday: 0, ordersTotal: 0, pendingOrders: 0, ownOrders });
+  }
+  const agg = await c.env.DB.prepare(
+    `SELECT
+       COUNT(*) AS ordersTotal,
+       COALESCE(SUM(CASE WHEN payment_status = 'successful' THEN total_cents ELSE 0 END), 0) AS salesTotalCents,
+       COALESCE(SUM(CASE WHEN substr(created_at, 1, 10) = date('now') THEN 1 ELSE 0 END), 0) AS ordersToday,
+       COALESCE(SUM(CASE WHEN substr(created_at, 1, 10) = date('now') AND payment_status = 'successful' THEN total_cents ELSE 0 END), 0) AS salesTodayCents,
+       COALESCE(SUM(CASE WHEN status NOT IN ('Delivered', 'Cancelled', 'Refunded') THEN 1 ELSE 0 END), 0) AS pendingOrders
+     FROM orders WHERE business_id = ?`
+  ).bind(a.user.business_id).first<any>();
+  return json(c, {
+    salesTodayCents: Number(agg?.salesTodayCents ?? 0),
+    salesTotalCents: Number(agg?.salesTotalCents ?? 0),
+    ordersToday: Number(agg?.ordersToday ?? 0),
+    ordersTotal: Number(agg?.ordersTotal ?? 0),
+    pendingOrders: Number(agg?.pendingOrders ?? 0),
+    ownOrders,
+  });
+});
+
 // ---------- public catalog ----------
 
 app.get("/api/config", async (c) => {
@@ -293,15 +399,21 @@ app.get("/api/config", async (c) => {
   const banners = await c.env.DB.prepare("SELECT id, title, subtitle, image, link FROM banners WHERE active = 1").all<any>();
   const settings = await c.env.DB.prepare("SELECT key, value FROM app_settings").all<any>();
   const byKey = Object.fromEntries((settings.results ?? []).map((r) => [r.key, r.value]));
+  const fees = await loadFeeSettings(c.env.DB, feeEnvRaw(c.env));
   return json(c, {
     appName: byKey.app_name || "Grand Elephants",
-    appSlogan: byKey.app_slogan || "Premium Marketplace & Luxury Heritage",
+    appSlogan: byKey.app_slogan || "Move With Conviction",
     appLogo: byKey.app_logo || "",
     currency: "ZMW",
     categories: (cats.results ?? []).map((r) => ({ id: String(r.id), name: r.name, icon: r.icon, enabled: r.enabled === 1 })),
     banners: banners.results ?? [],
     zraEnabled: byKey.zra_enabled === "1",
-    feeInfo: { vatPct: Number(envV(c, "VAT_PCT", "16")), commissionPct: Number(envV(c, "PLATFORM_COMMISSION_PCT", "15")) },
+    feeInfo: {
+      vatPct: fees.vatPct,
+      commissionPct: fees.commissionPct,
+      deliveryBaseFeeCents: fees.deliveryBaseFeeCents,
+      deliveryPerKmCents: fees.deliveryPerKmCents,
+    },
   });
 });
 
@@ -323,7 +435,10 @@ app.get("/api/businesses", async (c) => {  const rows = await c.env.DB.prepare("
 });
 
 app.get("/api/products", async (c) => {
-  const { category, business, q } = c.req.query();
+  const { category, business, q, sort } = c.req.query();
+  if (sort === "new" || sort === "trending" || sort === "suggested") {
+    return json(c, await productFeed(c.env.DB, sort, c));
+  }
   let sql = `SELECT p.*, b.name AS business_name FROM products p JOIN businesses b ON b.id = p.business_id WHERE p.active = 1 AND b.status = 'approved'`;
   const vals: unknown[] = [];
   if (category) { sql += " AND p.category = ?"; vals.push(category); }
@@ -333,6 +448,80 @@ app.get("/api/products", async (c) => {
   const rows = await c.env.DB.prepare(sql).bind(...vals).all<any>();
   return json(c, (rows.results ?? []).map(productJson));
 });
+
+// Product discovery feeds. All three return the exact same array shape as
+// GET /api/products (productJson[]); `?limit=` (1..50, default 12) applies.
+
+const PRODUCT_FEED_BASE = "SELECT p.*, b.name AS business_name FROM products p JOIN businesses b ON b.id = p.business_id";
+const PRODUCT_FEED_WHERE = " WHERE p.active = 1 AND b.status = 'approved'";
+const UNITS_SOLD = "COALESCE(SUM(CASE WHEN o.payment_status = 'successful' THEN oi.quantity ELSE 0 END), 0) AS units_sold";
+const SALES_JOINS = " LEFT JOIN order_items oi ON oi.product_id = p.id LEFT JOIN orders o ON o.id = oi.order_id";
+
+function feedLimit(c: any, dflt = 12): number {
+  const n = Math.floor(Number(c.req.query("limit")));
+  return Number.isFinite(n) && n > 0 ? Math.min(n, 50) : dflt;
+}
+
+/** Newest products first (created_at DESC). */
+async function newFeed(db: D1Database, limit: number) {
+  const rows = await db.prepare(`${PRODUCT_FEED_BASE}${PRODUCT_FEED_WHERE} ORDER BY p.created_at DESC, p.id DESC LIMIT ?`)
+    .bind(limit).all<any>();
+  return (rows.results ?? []).map(productJson);
+}
+
+/** Best sellers first (paid units sold), falling back to newest when nothing has sold. */
+async function trendingFeed(db: D1Database, limit: number) {
+  const rows = await db.prepare(
+    `SELECT p.*, b.name AS business_name, ${UNITS_SOLD}
+     FROM products p JOIN businesses b ON b.id = p.business_id${SALES_JOINS}
+     WHERE p.active = 1 AND b.status = 'approved'
+     GROUP BY p.id
+     ORDER BY units_sold DESC, p.created_at DESC, p.id DESC
+     LIMIT ?`
+  ).bind(limit).all<any>();
+  return (rows.results ?? []).map(productJson);
+}
+
+/** Signed-in: categories the buyer has bought before rank first, then best sellers. Anonymous: trending. */
+async function suggestedFeed(db: D1Database, userId: number | null, limit: number) {
+  if (userId != null) {
+    const cats = await db.prepare(
+      `SELECT DISTINCT p.category FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+       JOIN products p ON p.id = oi.product_id
+       WHERE o.user_id = ? AND p.category != ''`
+    ).bind(userId).all<any>();
+    const liked = (cats.results ?? []).map((r) => String(r.category)).slice(0, 10);
+    if (liked.length) {
+      const ph = liked.map(() => "?").join(",");
+      const rows = await db.prepare(
+        `SELECT p.*, b.name AS business_name,
+           CASE WHEN p.category IN (${ph}) THEN 1 ELSE 0 END AS cat_rank, ${UNITS_SOLD}
+         FROM products p JOIN businesses b ON b.id = p.business_id${SALES_JOINS}
+         WHERE p.active = 1 AND b.status = 'approved'
+         GROUP BY p.id
+         ORDER BY cat_rank DESC, units_sold DESC, p.created_at DESC, p.id DESC
+         LIMIT ?`
+      ).bind(...liked, limit).all<any>();
+      if (rows.results?.length) return (rows.results as any[]).map(productJson);
+    }
+  }
+  return trendingFeed(db, limit);
+}
+
+async function productFeed(db: D1Database, sort: "new" | "trending" | "suggested", c: any): Promise<unknown[]> {
+  const limit = feedLimit(c);
+  if (sort === "new") return newFeed(db, limit);
+  if (sort === "trending") return trendingFeed(db, limit);
+  const a = await authFromRequest(db, c.env, c.req.raw); // token optional
+  return suggestedFeed(db, a ? a.id : null, limit);
+}
+
+// Dedicated feed paths (registered BEFORE /api/products/:id so they are not
+// swallowed by the :id wildcard).
+app.get("/api/products/new", async (c) => json(c, await productFeed(c.env.DB, "new", c)));
+app.get("/api/products/trending", async (c) => json(c, await productFeed(c.env.DB, "trending", c)));
+app.get("/api/products/suggested", async (c) => json(c, await productFeed(c.env.DB, "suggested", c)));
 
 app.get("/api/products/:id", async (c) => {
   const row = await c.env.DB.prepare(
@@ -353,6 +542,10 @@ app.post("/api/orders", async (c) => {
   const b = await body(c);
   const items = Array.isArray(b.items) ? b.items : [];
   if (!items.length) return badRequest(c, "items are required");
+
+  // Buyer ZRA TPIN: optional, integer-only, exactly 10 digits (spaces/dashes ignored).
+  const buyerTpin = b.tpin === undefined || b.tpin === null ? "" : String(b.tpin).replace(/[\s-]/g, "");
+  if (buyerTpin && !/^\d{10}$/.test(buyerTpin)) return badRequest(c, "tpin must be exactly 10 digits");
 
   // Load products and enforce a single business per order.
   const placeholders = items.map(() => "?").join(",");
@@ -391,10 +584,11 @@ app.post("/api/orders", async (c) => {
   await c.env.DB.batch([
     c.env.DB.prepare(
       `INSERT INTO orders (id, user_id, business_id, subtotal_cents, delivery_fee_cents, vat_cents, total_cents, status, payment_method, payment_status,
-        delivery_address, delivery_method, customer_phone, notes, reference_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', ?, 'pending', ?, ?, ?, ?, ?)`
+        delivery_address, delivery_method, customer_phone, notes, reference_id, buyer_tpin)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', ?, 'pending', ?, ?, ?, ?, ?, ?)`
     ).bind(orderId, a.id, businessId, totals.subtotalCents, totals.deliveryFeeCents, totals.vatCents, totals.totalCents,
-      paymentMethod, b.deliveryAddress ?? "", b.deliveryMethod ?? "standard", normPhone(b.customerPhone ?? a.user.phone), b.notes ?? null, orderId),
+      paymentMethod, b.deliveryAddress ?? "", b.deliveryMethod ?? "standard", normPhone(b.customerPhone ?? a.user.phone), b.notes ?? null, orderId,
+      buyerTpin || null),
     ...normalized.map((n) => c.env.DB.prepare(
       "INSERT INTO order_items (order_id, product_id, name, price_cents, image, quantity) VALUES (?, ?, ?, ?, ?, ?)"
     ).bind(orderId, n.productId, n.name, n.priceCents, n.image, n.quantity)),
@@ -450,18 +644,85 @@ app.get("/api/orders", async (c) => {
   return json(c, out);
 });
 
+/** Buyer, assigned rider, or anyone who manages the seller business. */
+async function canViewOrder(db: D1Database, a: { id: number; user: any }, row: any): Promise<boolean> {
+  if (row.user_id === a.id) return true;
+  if (a.user.role === "rider" && row.rider_id) {
+    const assigned = await db.prepare("SELECT id FROM riders WHERE id = ? AND user_id = ?").bind(row.rider_id, a.id).first();
+    if (assigned) return true;
+  }
+  return canManageBusiness(db, a.id, row.business_id);
+}
+
 app.get("/api/orders/:id", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a) return unauthorized(c);
   const row = await c.env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(c.req.param("id")).first<any>();
   if (!row) return notFound(c, "Order not found");
-  const isOwner = row.user_id === a.id;
-  const isAssignedRider = a.user.role === "rider" && row.rider_id
-    ? !!(await c.env.DB.prepare("SELECT id FROM riders WHERE id = ? AND user_id = ?").bind(row.rider_id, a.id).first())
-    : false;
-  const canSee = isOwner || isAssignedRider || await canManageBusiness(c.env.DB, a.id, row.business_id);
-  if (!canSee) return unauthorized(c, "Not your order");
+  if (!await canViewOrder(c.env.DB, a, row)) return unauthorized(c, "Not your order");
   return json(c, { order: await orderJson(c.env.DB, row) });
+});
+
+/**
+ * Printable receipt for one order (same access rule as GET /api/orders/:id).
+ * Response: { receipt: { orderNumber, invoiceNo, status, paymentMethod,
+ * paymentStatus, transactionId, referenceId, createdAt, deliveredAt, currency,
+ * business: { id, name, address, tpin },
+ * buyer: { name, phone, tpin },
+ * delivery: { address, method, feeCents, riderName },
+ * items: [{ name, image, unitPriceCents, quantity, lineTotalCents }],
+ * subtotalCents, vatPct, vatCents, deliveryFeeCents, totalCents } }
+ */
+app.get("/api/orders/:id/receipt", async (c) => {
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
+  if (!a) return unauthorized(c);
+  const row = await c.env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(c.req.param("id")).first<any>();
+  if (!row) return notFound(c, "Order not found");
+  if (!await canViewOrder(c.env.DB, a, row)) return unauthorized(c, "Not your order");
+
+  const [biz, buyer, invoice, items, rider, feeSettings] = await Promise.all([
+    c.env.DB.prepare("SELECT id, name, address, tpin FROM businesses WHERE id = ?").bind(row.business_id).first<any>(),
+    c.env.DB.prepare("SELECT name, phone FROM users WHERE id = ?").bind(row.user_id).first<any>(),
+    c.env.DB.prepare("SELECT invoice_no FROM invoices WHERE order_id = ?").bind(row.id).first<any>(),
+    c.env.DB.prepare("SELECT name, price_cents, image, quantity FROM order_items WHERE order_id = ?").bind(row.id).all<any>(),
+    row.rider_id ? c.env.DB.prepare("SELECT name FROM riders WHERE id = ?").bind(row.rider_id).first<any>() : Promise.resolve(null),
+    loadFeeSettings(c.env.DB, feeEnvRaw(c.env)),
+  ]);
+  const lines = (items.results ?? []).map((it: any) => ({
+    name: it.name,
+    image: it.image ?? "",
+    unitPriceCents: it.price_cents,
+    quantity: it.quantity,
+    lineTotalCents: it.price_cents * it.quantity,
+  }));
+  return json(c, {
+    receipt: {
+      orderNumber: row.id,
+      invoiceNo: invoice?.invoice_no ?? null,
+      status: row.status,
+      paymentMethod: row.payment_method,
+      paymentStatus: row.payment_status,
+      transactionId: row.transaction_id ?? "",
+      referenceId: row.reference_id ?? "",
+      createdAt: row.created_at,
+      deliveredAt: row.delivered_at ?? null,
+      currency: "ZMW",
+      vatPct: feeSettings.vatPct,
+      business: { id: String(biz?.id ?? row.business_id), name: biz?.name ?? "", address: biz?.address ?? "", tpin: biz?.tpin ?? "" },
+      buyer: { name: buyer?.name ?? "", phone: buyer?.phone ?? row.customer_phone ?? "", tpin: row.buyer_tpin ?? "" },
+      delivery: {
+        address: row.delivery_address ?? "",
+        method: row.delivery_method ?? "standard",
+        feeCents: row.delivery_fee_cents,
+        riderName: rider?.name ?? "",
+      },
+      items: lines,
+      subtotalCents: row.subtotal_cents,
+      vatCents: row.vat_cents,
+      deliveryFeeCents: row.delivery_fee_cents,
+      totalCents: row.total_cents,
+    },
+  });
 });
 
 app.post("/api/orders/:id/cancel", async (c) => {
@@ -550,30 +811,48 @@ app.put("/api/businesses/me", async (c) => {
   return json(c, { ok: true });
 });
 
+app.get("/api/businesses/me/collection-numbers", async (c) => {
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
+  if (!a) return unauthorized(c);
+  const businessId = await businessScope(c.env.DB, a, { businessId: c.req.query("businessId") });
+  if (businessId == null) return unauthorized(c, "No business");
+  const rows = await c.env.DB.prepare("SELECT * FROM collection_numbers WHERE business_id = ? ORDER BY is_default DESC, id DESC").bind(businessId).all<any>();
+  return json(c, (rows.results ?? []).map((n) => ({
+    id: String(n.id), businessName: n.business_name, businessId: String(n.business_id),
+    network: n.network, phoneNumber: n.phone_number, tillNumber: n.till_number,
+    isActive: n.is_active === 1, isDefault: n.is_default === 1, addedBy: n.added_by,
+    createdAt: n.created_at,
+  })));
+});
+
 app.post("/api/businesses/me/collection-numbers", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !a.user.business_id) return unauthorized(c);
+  if (!a) return unauthorized(c);
   const b = await body(c);
+  const businessId = await businessScope(c.env.DB, a, b);
+  if (businessId == null) return unauthorized(c, "No business");
   if (!b.phoneNumber || !b.network) return badRequest(c, "phoneNumber and network are required");
   const networks = ["mtn", "airtel", "zamtel"];
   if (!networks.includes(b.network)) return badRequest(c, "network must be mtn, airtel or zamtel");
-  const biz = await getBusiness(c.env.DB, a.user.business_id);
+  const biz = await getBusiness(c.env.DB, businessId);
   const isSuper = isSuperadminPhone(c.env, a.user.phone) || hasRole(a.user, "admin", "superadmin");
   const r = await c.env.DB.prepare(
     `INSERT INTO collection_numbers (business_id, business_name, network, phone_number, till_number, is_active, is_default, added_by)
      VALUES (?, ?, ?, ?, ?, 1, ?, ?)`
-  ).bind(a.user.business_id, b.businessName ?? biz?.name ?? "", b.network, normPhone(b.phoneNumber), b.tillNumber ?? "",
+  ).bind(businessId, b.businessName ?? biz?.name ?? "", b.network, normPhone(b.phoneNumber), b.tillNumber ?? "",
     b.isDefault ? 1 : 0, isSuper ? "superadmin" : "business").run();
   if (b.isDefault) {
-    await c.env.DB.prepare("UPDATE collection_numbers SET is_default = 0 WHERE business_id = ? AND id != ?").bind(a.user.business_id, r.meta.last_row_id).run();
+    await c.env.DB.prepare("UPDATE collection_numbers SET is_default = 0 WHERE business_id = ? AND id != ?").bind(businessId, r.meta.last_row_id).run();
   }
   return json(c, { ok: true, id: String(r.meta.last_row_id) }, 201);
 });
 
 app.put("/api/businesses/me/collection-numbers/:id", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !a.user.business_id) return unauthorized(c);
+  if (!a) return unauthorized(c);
   const b = await body(c);
+  const businessId = await businessScope(c.env.DB, a, b);
+  if (businessId == null) return unauthorized(c, "No business");
   const sets: string[] = [];
   const vals: unknown[] = [];
   for (const [field, col] of [["network", "network"], ["phoneNumber", "phone_number"], ["tillNumber", "till_number"], ["businessName", "business_name"]] as const) {
@@ -582,18 +861,20 @@ app.put("/api/businesses/me/collection-numbers/:id", async (c) => {
   if (b.isActive !== undefined) { sets.push("is_active = ?"); vals.push(b.isActive ? 1 : 0); }
   if (b.isDefault === true) { sets.push("is_default = ?"); vals.push(1); }
   if (!sets.length) return badRequest(c, "nothing to update");
-  vals.push(a.user.business_id, Number(c.req.param("id")));
+  vals.push(businessId, Number(c.req.param("id")));
   await c.env.DB.prepare(`UPDATE collection_numbers SET ${sets.join(", ")}, updated_at = datetime('now') WHERE business_id = ? AND id = ?`).bind(...vals).run();
   if (b.isDefault === true) {
-    await c.env.DB.prepare("UPDATE collection_numbers SET is_default = 0 WHERE business_id = ? AND id != ?").bind(a.user.business_id, Number(c.req.param("id"))).run();
+    await c.env.DB.prepare("UPDATE collection_numbers SET is_default = 0 WHERE business_id = ? AND id != ?").bind(businessId, Number(c.req.param("id"))).run();
   }
   return json(c, { ok: true });
 });
 
 app.delete("/api/businesses/me/collection-numbers/:id", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !a.user.business_id) return unauthorized(c);
-  await c.env.DB.prepare("DELETE FROM collection_numbers WHERE business_id = ? AND id = ?").bind(a.user.business_id, Number(c.req.param("id"))).run();
+  if (!a) return unauthorized(c);
+  const businessId = await businessScope(c.env.DB, a, { businessId: c.req.query("businessId") });
+  if (businessId == null) return unauthorized(c, "No business");
+  await c.env.DB.prepare("DELETE FROM collection_numbers WHERE business_id = ? AND id = ?").bind(businessId, Number(c.req.param("id"))).run();
   return json(c, { ok: true });
 });
 
@@ -601,15 +882,19 @@ app.delete("/api/businesses/me/collection-numbers/:id", async (c) => {
 
 app.get("/api/businesses/me/products", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !a.user.business_id) return unauthorized(c);
-  const rows = await c.env.DB.prepare("SELECT * FROM products WHERE business_id = ? ORDER BY id DESC").bind(a.user.business_id).all<any>();
+  if (!a) return unauthorized(c);
+  const businessId = await businessScope(c.env.DB, a, { businessId: c.req.query("businessId") });
+  if (businessId == null) return unauthorized(c, "No business");
+  const rows = await c.env.DB.prepare("SELECT * FROM products WHERE business_id = ? ORDER BY id DESC").bind(businessId).all<any>();
   return json(c, (rows.results ?? []).map(productJson));
 });
 
 app.post("/api/businesses/me/products", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !a.user.business_id) return unauthorized(c);
+  if (!a) return unauthorized(c);
   const b = await body(c);
+  const businessId = await businessScope(c.env.DB, a, b);
+  if (businessId == null) return unauthorized(c, "No business");
   if (!b.name || !b.price) return badRequest(c, "name and price are required");
   const priceCents = Math.round(Number(b.price) * 100);
   if (!Number.isFinite(priceCents) || priceCents <= 0) return badRequest(c, "invalid price");
@@ -617,15 +902,17 @@ app.post("/api/businesses/me/products", async (c) => {
   const r = await c.env.DB.prepare(
     `INSERT INTO products (business_id, name, price_cents, image, description, category, is_ghost, stock, active)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`
-  ).bind(a.user.business_id, String(b.name).slice(0, 120), priceCents, b.image ?? "", b.description ?? "",
+  ).bind(businessId, String(b.name).slice(0, 120), priceCents, b.image ?? "", b.description ?? "",
     b.category ?? "", b.isGhost ? 1 : 0, Number(b.stock) || 0).run();
   return json(c, { ok: true, id: String(r.meta.last_row_id) }, 201);
 });
 
 app.put("/api/businesses/me/products/:id", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !a.user.business_id) return unauthorized(c);
+  if (!a) return unauthorized(c);
   const b = await body(c);
+  const businessId = await businessScope(c.env.DB, a, b);
+  if (businessId == null) return unauthorized(c, "No business");
   const sets: string[] = [];
   const vals: unknown[] = [];
   const fields: [string, string][] = [["name", "name"], ["image", "image"], ["description", "description"], ["category", "category"]];
@@ -635,16 +922,18 @@ app.put("/api/businesses/me/products/:id", async (c) => {
   if (b.isGhost !== undefined) { sets.push("is_ghost = ?"); vals.push(b.isGhost ? 1 : 0); }
   if (b.active !== undefined) { sets.push("active = ?"); vals.push(b.active ? 1 : 0); }
   if (!sets.length) return badRequest(c, "nothing to update");
-  vals.push(a.user.business_id, Number(c.req.param("id")));
+  vals.push(businessId, Number(c.req.param("id")));
   await c.env.DB.prepare(`UPDATE products SET ${sets.join(", ")}, updated_at = datetime('now') WHERE business_id = ? AND id = ?`).bind(...vals).run();
   return json(c, { ok: true });
 });
 
 app.delete("/api/businesses/me/products/:id", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !a.user.business_id) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  const businessId = await businessScope(c.env.DB, a, { businessId: c.req.query("businessId") });
+  if (businessId == null) return unauthorized(c, "No business");
   await c.env.DB.prepare("UPDATE products SET active = 0, updated_at = datetime('now') WHERE business_id = ? AND id = ?")
-    .bind(a.user.business_id, Number(c.req.param("id"))).run();
+    .bind(businessId, Number(c.req.param("id"))).run();
   return json(c, { ok: true });
 });
 
@@ -832,7 +1121,7 @@ app.post("/api/riders/me/location", async (c) => {
   return json(c, { ok: true });
 });
 
-app.post("/api/orders/:id/rider-status", async (c) => {
+async function riderOrderStatus(c: Ctx) {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a) return unauthorized(c);
   const b = await body(c);
@@ -841,17 +1130,26 @@ app.post("/api/orders/:id/rider-status", async (c) => {
   const rider = await c.env.DB.prepare("SELECT id FROM riders WHERE id = ? AND user_id = ?").bind(order.rider_id, a.id).first<any>();
   if (!rider) return unauthorized(c, "Not assigned to you");
   if (!["Out for Delivery", "Delivered"].includes(b.status)) return badRequest(c, "status must be Out for Delivery or Delivered");
+  const proofPhoto = typeof b.proofPhoto === "string" && b.proofPhoto.trim() ? String(b.proofPhoto) : null;
+  const photoSet = proofPhoto ? ", proof_photo = ?" : "";
   if (b.status === "Delivered") {
     if (order.delivery_fee_cents > 0) {
       await c.env.DB.prepare("UPDATE riders SET balance_cents = balance_cents + ? WHERE id = ?").bind(order.delivery_fee_cents, order.rider_id).run();
     }
-    await c.env.DB.prepare("UPDATE orders SET status = 'Delivered', delivered_at = datetime('now'), updated_at = datetime('now') WHERE id = ?").bind(order.id).run();
+    const sets = `status = 'Delivered', delivered_at = datetime('now'), updated_at = datetime('now')${photoSet}`;
+    const vals: unknown[] = proofPhoto ? [proofPhoto, order.id] : [order.id];
+    await c.env.DB.prepare(`UPDATE orders SET ${sets} WHERE id = ?`).bind(...vals).run();
     await pushNotif(c.env.DB, c.env, order.user_id, "Delivered", `Order ${order.id} has been delivered. Enjoy!`, "order", { orderId: order.id });
   } else {
-    await c.env.DB.prepare("UPDATE orders SET status = 'Out for Delivery', updated_at = datetime('now') WHERE id = ?").bind(order.id).run();
+    const sets = `status = 'Out for Delivery', updated_at = datetime('now')${photoSet}`;
+    const vals: unknown[] = proofPhoto ? [proofPhoto, order.id] : [order.id];
+    await c.env.DB.prepare(`UPDATE orders SET ${sets} WHERE id = ?`).bind(...vals).run();
   }
   return json(c, { ok: true });
-});
+}
+
+app.post("/api/orders/:id/rider-status", riderOrderStatus);
+app.patch("/api/orders/:id/rider-status", riderOrderStatus);
 
 // notifications, addresses, chat (customer-facing)
 
@@ -1015,25 +1313,40 @@ app.post("/api/admin/rider-applications/:id/approve", async (c) => {
   const u = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(id).first<any>();
   if (!u) return notFound(c, "User not found");
   const b = await body(c);
-  const businessId = Number(b.businessId);
-  const biz = businessId ? await getBusiness(c.env.DB, businessId) : null;
+  // riders.business_id is NOT NULL -> always resolve a business (body, else default platform business).
+  let biz: any = null;
+  const askedId = Number(b.businessId);
+  if (Number.isInteger(askedId) && askedId > 0) biz = await getBusiness(c.env.DB, askedId);
+  if (!biz) biz = await getBusiness(c.env.DB, await resolveDefaultBusiness(c.env.DB, a.id));
   await c.env.DB.prepare("UPDATE users SET role = 'rider', rider_status = 'approved', updated_at = datetime('now') WHERE id = ?").bind(id).run();
-  if (biz) {
+  const hasFleetRow = await c.env.DB.prepare("SELECT id FROM riders WHERE user_id = ?").bind(id).first<any>();
+  if (!hasFleetRow) {
     await c.env.DB.prepare("INSERT OR IGNORE INTO riders (user_id, business_id, name, phone, vehicle, status) VALUES (?, ?, ?, ?, ?, 'approved')")
       .bind(id, biz.id, u.name ?? "", u.phone, b.vehicle ?? "").run();
+  } else if (b.vehicle !== undefined) {
+    await c.env.DB.prepare("UPDATE riders SET vehicle = ?, updated_at = datetime('now') WHERE user_id = ?").bind(String(b.vehicle), id).run();
   }
   await pushNotif(c.env.DB, c.env, id, "Rider approved", `You are now a rider${biz ? ` for ${biz.name}` : ""}. Go online to start delivering.`, "rider").catch(() => {});
-  await logAction(c.env.DB, a.id, "rider_approved", "user", String(id));
-  return json(c, { ok: true });
+  await logAction(c.env.DB, a.id, "rider_approved", "user", String(id), { businessId: biz?.id ?? null });
+  return json(c, { ok: true, businessId: String(biz?.id ?? "") });
 });
 
 app.post("/api/admin/riders/:id/status", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
   const b = await body(c);
-  if (!["approved", "suspended"].includes(b.status)) return badRequest(c, "status must be approved or suspended");
+  if (!["approved", "suspended", "rejected"].includes(b.status)) return badRequest(c, "status must be approved, suspended or rejected");
+  const riderId = Number(c.req.param("id"));
+  const rider = await c.env.DB.prepare("SELECT id, user_id FROM riders WHERE id = ?").bind(riderId).first<any>();
+  if (!rider) return notFound(c, "Rider not found");
   await c.env.DB.prepare("UPDATE riders SET status = ?, updated_at = datetime('now') WHERE id = ?")
-    .bind(b.status, Number(c.req.param("id"))).run();
+    .bind(b.status, riderId).run();
+  // Keep the user's rider_status in sync (users.rider_status has no "suspended").
+  if (b.status === "approved" || b.status === "rejected") {
+    await c.env.DB.prepare("UPDATE users SET rider_status = ?, updated_at = datetime('now') WHERE id = ?")
+      .bind(b.status, rider.user_id).run();
+  }
+  await logAction(c.env.DB, a.id, `rider_${b.status}`, "rider", String(riderId));
   return json(c, { ok: true });
 });
 
@@ -1058,12 +1371,7 @@ app.post("/api/admin/riders/:id/payout", async (c) => {
   const rider = await c.env.DB.prepare("SELECT * FROM riders WHERE id = ?").bind(Number(c.req.param("id"))).first<any>();
   if (!rider) return notFound(c, "Rider not found");
   if (rider.balance_cents < 2000) return badRequest(c, "Rider balance must be at least K20 to pay out");
-  const feeSettings = parseSettings({
-    VAT_PCT: envV(c, "VAT_PCT", "16"), PLATFORM_COMMISSION_PCT: envV(c, "PLATFORM_COMMISSION_PCT", "15"),
-    DELIVERY_BASE_FEE_CENTS: envV(c, "DELIVERY_BASE_FEE_CENTS", "2500"), DELIVERY_PER_KM_CENTS: envV(c, "DELIVERY_PER_KM_CENTS", "1000"),
-    LIPILA_COLLECTION_FEE_PCT: envV(c, "LIPILA_COLLECTION_FEE_PCT", "2.5"), LIPILA_DISBURSEMENT_FEE_PCT: envV(c, "LIPILA_DISBURSEMENT_FEE_PCT", "1.5"),
-    CARD_LIPILA_COLLECTION_FEE_PCT: envV(c, "CARD_LIPILA_COLLECTION_FEE_PCT", "2.5"),
-  });
+  const feeSettings = await loadFeeSettings(c.env.DB, feeEnvRaw(c.env));
   const amountCents = rider.balance_cents;
   const netCents = payoutNetCents(feeSettings, amountCents);
   const r = await c.env.DB.prepare(
@@ -1112,7 +1420,7 @@ app.get("/api/admin/lipila/balance", async (c) => {
 
 // payouts
 
-app.post("/api/businesses/me/payout", async (c) => {
+const businessPayoutHandler = async (c: Ctx) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a || !a.user.business_id) return unauthorized(c);
   const wallet = await c.env.DB.prepare("SELECT * FROM wallets WHERE business_id = ?").bind(a.user.business_id).first<any>();
@@ -1121,12 +1429,7 @@ app.post("/api/businesses/me/payout", async (c) => {
   if (!numbers) return badRequest(c, "Add a collection number first");
 
   const amountCents = wallet.balance_cents;
-  const feeSettings = parseSettings({
-    VAT_PCT: envV(c, "VAT_PCT", "16"), PLATFORM_COMMISSION_PCT: envV(c, "PLATFORM_COMMISSION_PCT", "15"),
-    DELIVERY_BASE_FEE_CENTS: envV(c, "DELIVERY_BASE_FEE_CENTS", "2500"), DELIVERY_PER_KM_CENTS: envV(c, "DELIVERY_PER_KM_CENTS", "1000"),
-    LIPILA_COLLECTION_FEE_PCT: envV(c, "LIPILA_COLLECTION_FEE_PCT", "2.5"), LIPILA_DISBURSEMENT_FEE_PCT: envV(c, "LIPILA_DISBURSEMENT_FEE_PCT", "1.5"),
-    CARD_LIPILA_COLLECTION_FEE_PCT: envV(c, "CARD_LIPILA_COLLECTION_FEE_PCT", "2.5"),
-  });
+  const feeSettings = await loadFeeSettings(c.env.DB, feeEnvRaw(c.env));
   const netCents = payoutNetCents(feeSettings, amountCents);
   const r = await c.env.DB.prepare(
     `INSERT INTO payouts (business_id, amount_cents, fee_cents, net_cents, phone, network, status, requested_by)
@@ -1159,9 +1462,13 @@ app.post("/api/businesses/me/payout", async (c) => {
     await sendSms(c.env, numbers.phone_number, msg.payoutSentSms(netCents, biz?.name ?? "")).catch(() => {});
   }
   return json(c, { ok: true, payoutId: String(payoutId), netCents });
-});
+};
 
-app.get("/api/businesses/me/payouts", async (c) => {
+// Both spellings are accepted: the Flutter client posts the singular, some screens use the plural.
+app.post("/api/businesses/me/payout", businessPayoutHandler);
+app.post("/api/businesses/me/payouts", businessPayoutHandler);
+
+const businessPayoutListHandler = async (c: Ctx) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a || !a.user.business_id) return unauthorized(c);
   const rows = await c.env.DB.prepare("SELECT * FROM payouts WHERE business_id = ? ORDER BY created_at DESC LIMIT 50").bind(a.user.business_id).all<any>();
@@ -1170,6 +1477,107 @@ app.get("/api/businesses/me/payouts", async (c) => {
     fee: p.fee_cents / 100, feeCents: p.fee_cents, net: p.net_cents / 100, netCents: p.net_cents,
     phone: p.phone, network: p.network, status: p.status, createdAt: p.created_at, error: p.error,
   })));
+};
+
+// Both spellings are accepted for GET too.
+app.get("/api/businesses/me/payout", businessPayoutListHandler);
+app.get("/api/businesses/me/payouts", businessPayoutListHandler);
+
+// ---------- business VAT / tax ----------
+
+/** YYYY-MM-DD check for period filters. */
+const isoDate = (v: unknown): v is string => typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
+
+/** VAT summary for one business, from what orders actually stored (VAT_PCT used for legacy 0-VAT rows). */
+app.get("/api/businesses/me/tax", async (c) => {
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
+  if (!a) return unauthorized(c);
+  const businessId = await businessScope(c.env.DB, a, { businessId: c.req.query("businessId") });
+  if (businessId == null) return unauthorized(c, "No business");
+  const feeSettings = await loadFeeSettings(c.env.DB, feeEnvRaw(c.env));
+  const from = c.req.query("from") ?? "";
+  const to = c.req.query("to") ?? "";
+  let range = "";
+  const rangeVals: unknown[] = [];
+  if (isoDate(from)) { range += " AND substr(created_at, 1, 10) >= ?"; rangeVals.push(from); }
+  if (isoDate(to)) { range += " AND substr(created_at, 1, 10) <= ?"; rangeVals.push(to); }
+
+  const agg = await c.env.DB.prepare(
+    `SELECT COUNT(*) AS salesCount,
+            COALESCE(SUM(subtotal_cents), 0) AS taxableSalesCents,
+            COALESCE(SUM(CASE WHEN vat_cents > 0 THEN vat_cents ELSE CAST(ROUND(subtotal_cents * ? / 100.0) AS INTEGER) END), 0) AS vatCollectedCents
+       FROM orders
+      WHERE business_id = ? AND payment_status = 'successful'${range}`
+  ).bind(feeSettings.vatPct, businessId, ...rangeVals).first<any>();
+
+  const sales = await c.env.DB.prepare(
+    `SELECT o.id, o.created_at, o.subtotal_cents, o.vat_cents, o.total_cents, o.buyer_tpin, i.invoice_no
+       FROM orders o LEFT JOIN invoices i ON i.order_id = o.id
+      WHERE o.business_id = ? AND o.payment_status = 'successful'${range}
+      ORDER BY o.created_at DESC LIMIT 200`
+  ).bind(businessId, ...rangeVals).all<any>();
+
+  const vatOf = (subtotalCents: number, storedVatCents: number): number =>
+    storedVatCents > 0 ? storedVatCents : Math.round(subtotalCents * feeSettings.vatPct / 100);
+
+  return json(c, {
+    businessId: String(businessId),
+    from: isoDate(from) ? from : null,
+    to: isoDate(to) ? to : null,
+    vatPct: feeSettings.vatPct,
+    salesCount: Number(agg?.salesCount ?? 0),
+    taxableSalesCents: Number(agg?.taxableSalesCents ?? 0),
+    vatCollectedCents: Number(agg?.vatCollectedCents ?? 0),
+    vatBySale: (sales.results ?? []).map((s: any) => ({
+      orderId: s.id,
+      invoiceNo: s.invoice_no ?? null,
+      date: s.created_at,
+      taxableCents: s.subtotal_cents,
+      vatCents: vatOf(s.subtotal_cents, s.vat_cents),
+      totalCents: s.total_cents,
+      tpin: s.buyer_tpin ?? "",
+    })),
+  });
+});
+
+app.get("/api/businesses/me/tax/payments", async (c) => {
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
+  if (!a) return unauthorized(c);
+  const businessId = await businessScope(c.env.DB, a, { businessId: c.req.query("businessId") });
+  if (businessId == null) return unauthorized(c, "No business");
+  const rows = await c.env.DB.prepare("SELECT * FROM tax_payments WHERE business_id = ? ORDER BY id DESC LIMIT 100")
+    .bind(businessId).all<any>();
+  return json(c, (rows.results ?? []).map((p) => ({
+    id: String(p.id),
+    periodStart: p.period_start,
+    periodEnd: p.period_end,
+    amountCents: p.amount_cents,
+    amount: p.amount_cents / 100,
+    reference: p.reference,
+    method: p.method,
+    createdAt: p.created_at,
+  })));
+});
+
+app.post("/api/businesses/me/tax/payments", async (c) => {
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
+  if (!a) return unauthorized(c);
+  const b = await body(c);
+  const businessId = await businessScope(c.env.DB, a, b);
+  if (businessId == null) return unauthorized(c, "No business");
+  const amountCents = b.amountCents !== undefined ? Math.round(Number(b.amountCents)) : Math.round(Number(b.amount) * 100);
+  if (!Number.isFinite(amountCents) || amountCents <= 0) return badRequest(c, "amountCents must be a positive integer");
+  const periodStart = b.periodStart;
+  const periodEnd = b.periodEnd;
+  if (!isoDate(periodStart) || !isoDate(periodEnd)) return badRequest(c, "periodStart and periodEnd must be YYYY-MM-DD");
+  if (periodEnd < periodStart) return badRequest(c, "periodEnd must not be before periodStart");
+  const r = await c.env.DB.prepare(
+    `INSERT INTO tax_payments (business_id, period_start, period_end, amount_cents, reference, method, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).bind(businessId, periodStart, periodEnd, amountCents, String(b.reference ?? "").slice(0, 80),
+    String(b.method ?? "").slice(0, 40), a.id).run();
+  await logAction(c.env.DB, a.id, "tax_payment_recorded", "tax_payment", String(r.meta.last_row_id), { amountCents, periodStart, periodEnd });
+  return json(c, { ok: true, id: String(r.meta.last_row_id) }, 201);
 });
 
 // invoices (customer)
@@ -1192,6 +1600,91 @@ app.get("/api/invoices/mine", async (c) => {
 });
 
 // ---------- admin ----------
+
+// admin product management (any product, any business)
+
+app.get("/api/admin/products", async (c) => {
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
+  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  const businessId = Number(c.req.query("businessId"));
+  let sql = "SELECT p.*, b.name AS business_name FROM products p JOIN businesses b ON b.id = p.business_id";
+  const vals: unknown[] = [];
+  if (Number.isInteger(businessId) && businessId > 0) { sql += " WHERE p.business_id = ?"; vals.push(businessId); }
+  sql += " ORDER BY p.id DESC LIMIT 500";
+  const rows = await c.env.DB.prepare(sql).bind(...vals).all<any>();
+  return json(c, (rows.results ?? []).map(productJson));
+});
+
+app.post("/api/admin/products", async (c) => {
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
+  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  const b = await body(c);
+  if (!b.name || !b.price) return badRequest(c, "name and price are required");
+  const priceCents = Math.round(Number(b.price) * 100);
+  if (!Number.isFinite(priceCents) || priceCents <= 0) return badRequest(c, "invalid price");
+  if (b.category && !isValidCategory(b.category)) return badRequest(c, "unknown category");
+  let businessId: number | null = null;
+  if (b.businessId !== undefined && b.businessId !== null && b.businessId !== "") {
+    const id = Number(b.businessId);
+    const biz = Number.isInteger(id) && id > 0 ? await getBusiness(c.env.DB, id) : null;
+    if (!biz) return badRequest(c, "business not found");
+    businessId = Number(biz.id);
+  } else {
+    businessId = await resolveDefaultBusiness(c.env.DB, a.id);
+  }
+  const r = await c.env.DB.prepare(
+    `INSERT INTO products (business_id, name, price_cents, image, description, category, is_ghost, stock, active)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(businessId, String(b.name).slice(0, 120), priceCents, b.image ?? "", b.description ?? "",
+    b.category ?? "", b.isGhost ? 1 : 0, Number(b.stock) || 0, b.active === false ? 0 : 1).run();
+  const id = String(r.meta.last_row_id);
+  await logAction(c.env.DB, a.id, "product_created", "product", id, { businessId, name: String(b.name).slice(0, 120) });
+  return json(c, { ok: true, id, businessId: String(businessId) }, 201);
+});
+
+app.put("/api/admin/products/:id", async (c) => {
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
+  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  const id = Number(c.req.param("id"));
+  const existing = await c.env.DB.prepare("SELECT id FROM products WHERE id = ?").bind(id).first<any>();
+  if (!existing) return notFound(c, "Product not found");
+  const b = await body(c);
+  if (b.category !== undefined && b.category !== "" && !isValidCategory(String(b.category))) return badRequest(c, "unknown category");
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  const fields: [string, string][] = [["name", "name"], ["image", "image"], ["description", "description"], ["category", "category"]];
+  for (const [field, col] of fields) if (b[field] !== undefined) { sets.push(`${col} = ?`); vals.push(String(b[field])); }
+  if (b.price !== undefined) {
+    const pc = Math.round(Number(b.price) * 100);
+    if (!Number.isFinite(pc) || pc <= 0) return badRequest(c, "invalid price");
+    sets.push("price_cents = ?"); vals.push(pc);
+  }
+  if (b.stock !== undefined) { sets.push("stock = ?"); vals.push(Math.max(0, Number(b.stock) || 0)); }
+  if (b.isGhost !== undefined) { sets.push("is_ghost = ?"); vals.push(b.isGhost ? 1 : 0); }
+  if (b.active !== undefined) { sets.push("active = ?"); vals.push(b.active ? 1 : 0); }
+  if (b.businessId !== undefined) {
+    const bid = Number(b.businessId);
+    const biz = Number.isInteger(bid) && bid > 0 ? await getBusiness(c.env.DB, bid) : null;
+    if (!biz) return badRequest(c, "business not found");
+    sets.push("business_id = ?"); vals.push(biz.id);
+  }
+  if (!sets.length) return badRequest(c, "nothing to update");
+  vals.push(id);
+  await c.env.DB.prepare(`UPDATE products SET ${sets.join(", ")}, updated_at = datetime('now') WHERE id = ?`).bind(...vals).run();
+  await logAction(c.env.DB, a.id, "product_updated", "product", String(id), b);
+  return json(c, { ok: true });
+});
+
+app.delete("/api/admin/products/:id", async (c) => {
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
+  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  const id = Number(c.req.param("id"));
+  const existing = await c.env.DB.prepare("SELECT id FROM products WHERE id = ?").bind(id).first<any>();
+  if (!existing) return notFound(c, "Product not found");
+  await c.env.DB.prepare("UPDATE products SET active = 0, updated_at = datetime('now') WHERE id = ?").bind(id).run();
+  await logAction(c.env.DB, a.id, "product_deleted", "product", String(id));
+  return json(c, { ok: true });
+});
 
 app.get("/api/admin/stats", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
@@ -1235,13 +1728,18 @@ app.patch("/api/admin/users/:id", async (c) => {
   const id = Number(c.req.param("id"));
   const sets: string[] = [];
   const vals: unknown[] = [];
-  const roles = ["user", "rider", "business", "employee", "admin", "superadmin"];
+  const assignableRoles = ["user", "rider", "business", "employee", "admin"];
   if (b.role !== undefined) {
-    if (!roles.includes(b.role)) return badRequest(c, "invalid role");
+    if (id === a.id) return json(c, { error: "You cannot change your own role" }, 403);
+    if (b.role === "superadmin") {
+      if (a.user.role !== "superadmin") return json(c, { error: "Only a superadmin can grant superadmin" }, 403);
+    } else if (!assignableRoles.includes(b.role)) {
+      return badRequest(c, "invalid role");
+    }
     sets.push("role = ?"); vals.push(b.role);
   }
   if (b.riderStatus !== undefined) {
-    if (!["none", "pending", "approved"].includes(b.riderStatus)) return badRequest(c, "invalid riderStatus");
+    if (!["none", "pending", "approved", "rejected"].includes(b.riderStatus)) return badRequest(c, "invalid riderStatus");
     sets.push("rider_status = ?"); vals.push(b.riderStatus);
   }
   if (b.name !== undefined) { sets.push("name = ?"); vals.push(String(b.name)); }
@@ -1380,6 +1878,7 @@ app.patch("/api/admin/settings", async (c) => {
     await c.env.DB.prepare("INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
       .bind(k, String(v)).run();
   }
+  invalidateFeeSettings();
   await logAction(c.env.DB, a.id, "settings_updated", "settings", null, b);
   return json(c, { ok: true });
 });

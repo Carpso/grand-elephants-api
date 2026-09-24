@@ -54,11 +54,13 @@ All money is stored as integer **cents** (ZMW). Fees in `src/fees.ts`.
 
 - Auth: `POST /api/auth/request-otp`, `POST /api/auth/verify-otp`, `GET/PATCH /api/me`
 - Catalog: `GET /api/config`, `/api/categories`, `/api/products`, `/api/products/:id`, `/api/products/:id/reviews`
-- Orders: `POST /api/orders`, `GET /api/orders`, `GET /api/orders/:id`, `POST /api/orders/:id/cancel`
-- Business: `/api/businesses/apply`, `/api/businesses/me`, `/api/businesses/me/products`, `/api/businesses/me/orders`, `/api/businesses/me/payout`, collection-numbers
+- Feeds: `GET /api/products/new`, `/api/products/trending`, `/api/products/suggested` (or `?sort=new|trending|suggested`), `?limit=` default 12
+- Orders: `POST /api/orders` (optional `tpin`, 10 digits → stored `buyer_tpin`), `GET /api/orders`, `GET /api/orders/:id`, `GET /api/orders/:id/receipt`, `POST /api/orders/:id/cancel`
+- Business: `/api/businesses/apply`, `/api/businesses/me`, `/api/businesses/me/products`, `/api/businesses/me/orders`, `/api/businesses/me/payout`, `/api/businesses/me/staff`, `/api/businesses/me/tax` + `/api/businesses/me/tax/payments` (auto VAT per sale; `src/smart_invoice.ts` stub for ZRA Smart Invoice), collection-numbers
 - Riders: `/api/riders/me`, `/api/riders/apply`, `/api/riders/me/deliveries`, `/api/riders/me/payouts`, `/api/riders/me/location`, `/api/orders/:id/rider-status`
 - Notifications/addresses/chat: `/api/notifications/mine`, `/api/addresses`, `/api/chat/messages`
-- Admin: `/api/admin/stats`, `/api/admin/users`, `/api/admin/orders`, `/api/admin/riders`, `/api/admin/rider-applications`, `/api/admin/rider-payouts`, `/api/admin/payouts`, `/api/admin/lipila/balance`, `/api/admin/categories`, `/api/admin/settings`, `/api/admin/actions`, `/api/admin/lipila-logs`
+- Admin: `/api/admin/stats`, `/api/admin/users`, `/api/admin/orders`, `/api/admin/products` (full CRUD — admins manage any business's products), `/api/admin/businesses` + `/:id/status`, `/api/admin/riders`, `/api/admin/rider-applications`, `/api/admin/rider-payouts`, `/api/admin/payouts`, `/api/admin/lipila/balance`, `/api/admin/categories`, `/api/admin/settings`, `/api/admin/actions`, `/api/admin/lipila-logs`
+- Employee: `GET /api/employee/stats` (business sales/orders when `business_id` set)
 - Webhooks: `POST /api/webhooks/lipila`, cron `GET /__cron`
 
 ## Database (D1)

@@ -11,6 +11,9 @@ export interface AuthEnv extends SmsEnv {
 
 const SUPERADMIN_ROLES = new Set(["superadmin", "admin"]);
 
+/** Failed attempts allowed per OTP code before it is burned (brute-force cap). */
+const MAX_OTP_ATTEMPTS = 5;
+
 /** True if the phone is a platform superadmin (from SUPERADMIN_PHONES secret). */
 export function isSuperadminPhone(env: AuthEnv, phone: string): boolean {
   const phones = (env.SUPERADMIN_PHONES ?? "")
@@ -51,9 +54,17 @@ export async function verifyOtp(db: D1Database, phone: string, code: string): Pr
     .first<{ id: number; code_hash: string; attempts: number; expires_at: string }>();
   if (!rows) return false;
 
+  // Brute-force cap: burn the code after 5 failed tries so it cannot be retried.
+  if (rows.attempts >= MAX_OTP_ATTEMPTS) {
+    await db.prepare("UPDATE otps SET used = 1 WHERE id = ?").bind(rows.id).run();
+    return false;
+  }
+
   const hash = await sha256Hex(String(code).trim());
   if (hash !== rows.code_hash) {
-    await db.prepare("UPDATE otps SET attempts = attempts + 1 WHERE id = ?").bind(rows.id).run();
+    const attempts = rows.attempts + 1;
+    await db.prepare("UPDATE otps SET attempts = ?, used = CASE WHEN ? >= ? THEN 1 ELSE used END WHERE id = ?")
+      .bind(attempts, attempts, MAX_OTP_ATTEMPTS, rows.id).run();
     return false;
   }
   await db.prepare("UPDATE otps SET used = 1 WHERE id = ?").bind(rows.id).run();
