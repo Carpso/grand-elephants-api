@@ -27,6 +27,22 @@ Guidance for AI coding agents working in this repository.
 - Keep `src/index.ts` Hono routes grouped by concern (auth, catalog, orders,
   business, riders, admin, webhooks, cron).
 
+## Deployment
+
+- `.\deploy.ps1` = `flutter build web --release` (Flutter repo) +
+  `npx wrangler deploy` — one worker serves both `/api/*` (Hono) and the
+  website (`[assets]` → `../grand-elephants-flutter/build/web`).
+- **Always verify after deploying**: `GET /api/products` must return JSON.
+  - Symptom of an **assets-only deployment** (Worker script missing at the
+    edge): every non-asset path returns an **empty-body 404**, and
+    `npx wrangler tail` fails with CF code `100311` ("Cannot tail a Worker
+    which only has assets").
+  - Fix: re-run `npx wrangler deploy` from this repo, then re-verify
+    `POST /api/auth/request-otp` → 200 `{"ok":true}`.
+  - Incident 2026-09-27: deployment `0e15538e` was uploaded assets-only, so
+    the app's Send Code / OTP flow got edge 404s; redeploy (`245a7263`)
+    resolved it with no code changes.
+
 ## SMS (Africa's Talking)
 
 - Live on the **production** API: `api.africastalking.com`, username

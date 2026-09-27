@@ -3,7 +3,23 @@
 All notable changes to the `grand-elephants-api` Cloudflare Worker.
 Format: [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased] — 2026-09-25
+## [Unreleased] — 2026-09-27
+
+### Fixed
+- **All `/api/*` routes returned empty-body 404s** (the app's Send Code button
+  got no response → no OTP request, no verify). The 2026-09-25 03:52Z
+  deployment (`0e15538e`) had been uploaded **assets-only, with no Worker
+  script**, so Cloudflare answered every non-asset path at the edge before the
+  Worker could run (`npx wrangler tail` failed with CF code `100311` "Cannot
+  tail a Worker which only has assets"). Fixed by re-running
+  `npx wrangler deploy` → version `245a7263-2617-4eab-89d2-f76ca63cd539`;
+  verified live: `POST /api/auth/request-otp` → 200 `{"ok":true}` (real SMS),
+  `POST /api/auth/verify-otp` → 401 for a wrong code, `GET /api/products` →
+  200 (16 bags), website assets + SPA fallback → 200. **No code changes.**
+  Prevention: always verify `GET /api/products` returns JSON after deploying
+  (see AGENTS.md → Deployment).
+
+## [2026-09-25]
 
 ### Added
 - **Admin product management**: `GET/POST /api/admin/products`,
