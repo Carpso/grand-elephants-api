@@ -1,6 +1,6 @@
 # SESSION_STATE — Grand Elephants API (Cloudflare Worker)
 
-Saved: 2026-09-25. Companion: same file in `grand-elephants-flutter`.
+Saved: 2026-09-27. Companion: same file in `grand-elephants-flutter`.
 
 ## Infra (no secrets in this file)
 - Worker/site: `https://grand-elephants-api.godfreymoseskalambo.workers.dev` (serves `/api/*` + Flutter web SPA via `[assets]` → `../grand-elephants-flutter/build/web`, SPA fallback + catch-all in `src/index.ts`).
@@ -12,7 +12,8 @@ Saved: 2026-09-25. Companion: same file in `grand-elephants-flutter`.
 - Cron `0 6 * * *` finalizes stuck payouts + expires unpaid orders.
 
 ## State
-- Last deploy: version `2bc40c3b-...` (2026-09-25), tsc 0, live smoke-verified (slogan, 16 bag products, 10 bag categories, 3 feeds).
+- Last deploy: version `245a7263-2617-4eab-89d2-f76ca63cd539` (2026-09-27), script + 81 assets; verified live: `request-otp` 200 `{"ok":true}` (real SMS), `verify-otp` 401 for wrong code, `/api/products` 200 (16 bags), `main.dart.js` 200, SPA fallback 200.
+- **Incident 2026-09-27 (resolved):** deployment `0e15538e` (2026-09-25 03:52Z) was uploaded **assets-only — no worker script** → every non-asset path returned an *empty* 404 (this is why the app's "Send Code" button got no response: `POST /api/auth/request-otp` died at the edge) and `wrangler tail` failed with CF code `100311` "Cannot tail a Worker which only has assets". Cause of that upload unknown (no Flutter/app code was at fault). Fix = `npx wrangler deploy` from this repo. **Diagnostic rule:** empty-body 404s + `100311` on tail → redeploy immediately, then re-verify `request-otp`.
 - D1 remote: migrations 001-003 applied (25 tables incl. `reviews`, `rider_payouts`, `proof_photo`, `buyer_tpin`, `tax_payments`, `riders.updated_at`), seed applied → 10 bag categories, 16 bag products with `assets/products/*.png`.
 
 ## This session's API changes (commit `6a5cb84`)
