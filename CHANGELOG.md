@@ -18,6 +18,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/).
   200 (16 bags), website assets + SPA fallback → 200. **No code changes.**
   Prevention: always verify `GET /api/products` returns JSON after deploying
   (see AGENTS.md → Deployment).
+- **All Worker secrets were wiped** by a second, foreign deployment
+  (`6841ad08`, 08:08:49Z — different config, no script/bindings) → `verify-otp`
+  500 (empty `JWT_SECRET`) and silent SMS failure (missing `AT_API_KEY`).
+  Secrets re-put from stored value sources; `verify-otp` → 200 + JWT,
+  `/api/me` → 200, full browser E2E (Send Code → Verify → Home) passes.
+  **Outstanding: `LIPILA_API_KEY` value is lost — re-fetch from the Lipila
+  dashboard and `npx wrangler secret put LIPILA_API_KEY`.** Note: `.dev.vars`
+  holds `local-*` placeholders only — never restore prod from it.
 
 ## [2026-09-25]
 

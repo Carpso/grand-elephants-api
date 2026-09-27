@@ -42,6 +42,13 @@ Guidance for AI coding agents working in this repository.
   - Incident 2026-09-27: deployment `0e15538e` was uploaded assets-only, so
     the app's Send Code / OTP flow got edge 404s; redeploy (`245a7263`)
     resolved it with no code changes.
+- **Foreign deploys happen.** A second deployer (other machine/session, config
+  with `compatibility_date = 2026-09-25`) has overwritten this worker twice
+  and once **wiped every secret** (`wrangler secret list` → `[]`). After any
+  deploy you did not personally run, check BOTH `GET /api/products` (JSON)
+  AND `npx wrangler secret list` (must show AT_API_KEY, JWT_SECRET, …).
+  Restoring secrets: value sources are listed in SESSION_STATE.md — never use
+  `.dev.vars` (it holds `local-*` dev placeholders).
 
 ## SMS (Africa's Talking)
 
