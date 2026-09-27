@@ -7,6 +7,7 @@ DROP TABLE IF EXISTS rider_payouts;
 DROP TABLE IF EXISTS lipila_logs;
 DROP TABLE IF EXISTS admin_actions;
 DROP TABLE IF EXISTS otps;
+DROP TABLE IF EXISTS otp_lockouts;
 DROP TABLE IF EXISTS notifications;
 DROP TABLE IF EXISTS chat_messages;
 DROP TABLE IF EXISTS addresses;
@@ -294,6 +295,12 @@ CREATE TABLE otps (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX idx_otps_phone ON otps(phone, used, expires_at);
+
+-- Phone locked out after too many failed OTP verifications (5 -> lockout).
+CREATE TABLE otp_lockouts (
+  phone TEXT PRIMARY KEY,
+  locked_until TEXT NOT NULL
+);
 
 CREATE TABLE banners (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

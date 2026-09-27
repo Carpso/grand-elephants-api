@@ -5,6 +5,8 @@
 // (app_settings.zra_enabled), syncInvoiceToZra pushes them; until then invoices
 // are fully functional locally (PDF/SMS) and ready to sync.
 
+import { submitInvoice, SmartInvoiceSubmission } from "./smart_invoice";
+
 export interface InvoiceLine {
   name: string;
   priceCents: number;
@@ -62,19 +64,18 @@ export function zraQrPayload(inv: InvoiceData): string {
 /**
  * Push an invoice to ZRA SmartInvoice. Until the ZRA sandbox API credentials
  * are provisioned (app_settings.zra_enabled='0'), this logs and returns null.
- * When enabled: POST the e-invoice payload, store returned AFC/ACF codes,
- * mark status='synced'.
+ * When enabled: POST the e-invoice payload via ./smart_invoice.ts, store
+ * returned AFC/ACF codes + QR, mark status='synced'.
  */
 export async function syncInvoiceToZra(
   db: D1Database,
-  env: { ZRA_API_KEY?: string },
+  env: { ZRA_API_KEY?: string; ZRA_BASE_URL?: string; ZRA_AUTH_SCHEME?: string },
   invoiceId: number
 ): Promise<{ synced: boolean; afc?: string; acf?: string; error?: string }> {
   const setting = await db.prepare("SELECT value FROM app_settings WHERE key = 'zra_enabled'").first<{ value: string }>();
-  const apiUrl = await db.prepare("SELECT value FROM app_settings WHERE key = 'zra_api_url'").first<{ value: string }>();
   const enabled = setting?.value === "1";
 
-  if (!enabled || !env.ZRA_API_KEY || !apiUrl?.value) {
+  if (!enabled || !env.ZRA_API_KEY) {
     console.log(`[ZRA] invoice ${invoiceId} not synced (zra_enabled=${enabled})`);
     return { synced: false };
   }
@@ -91,44 +92,53 @@ export async function syncInvoiceToZra(
     .first<any>();
   if (!inv) return { synced: false, error: "invoice not found" };
 
-  const res = await fetch(`${apiUrl.value}/invoice`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      Authorization: `Bearer ${env.ZRA_API_KEY}`,
-    },
-    body: JSON.stringify({
-      tpin: inv.tpin,
-      invoiceNo: inv.invoice_no,
-      issuedAt: inv.issued_at,
-      total: inv.total_cents / 100,
-      vat: inv.vat_cents / 100,
-      lines: JSON.parse(
-        JSON.stringify(
-          await db
-            .prepare("SELECT name, price_cents, quantity, vat_pct FROM invoice_items WHERE invoice_id = ?")
-            .bind(invoiceId)
-            .all()
-        )
-      ).results ?? [],
-    }),
-  });
-  const body = await res.text().catch(() => "");
-  if (!res.ok) return { synced: false, error: `ZRA sync failed (${res.status}): ${body.slice(0, 300)}` };
+  // Base URL: ZRA_BASE_URL env > app_settings zra_base_url > legacy zra_api_url
+  // > documented default (see smart_invoice.ts).
+  const cfgRows = await db
+    .prepare("SELECT key, value FROM app_settings WHERE key IN ('zra_base_url', 'zra_api_url')")
+    .all<any>();
+  const cfg = Object.fromEntries((cfgRows.results ?? []).map((r) => [r.key, String(r.value ?? "").trim()]));
+  const baseUrl = env.ZRA_BASE_URL?.trim() || cfg.zra_base_url || cfg.zra_api_url || undefined;
 
-  let data: any = {};
-  try { data = JSON.parse(body); } catch { /* keep empty */ }
-  const afc = data.afcCode ?? data.afc ?? null;
-  const acf = data.acfCode ?? data.acf ?? null;
+  const items = await db
+    .prepare("SELECT name, price_cents, quantity, vat_pct FROM invoice_items WHERE invoice_id = ?")
+    .bind(invoiceId)
+    .all<any>();
+
+  const submission: SmartInvoiceSubmission = {
+    invoiceId,
+    invoiceNo: inv.invoice_no,
+    orderId: inv.order_id,
+    businessId: inv.business_id,
+    buyerTpin: inv.buyer_tpin ?? "",
+    sellerTpin: inv.tpin ?? inv.tp_in ?? "",
+    subtotalCents: inv.subtotal_cents,
+    vatCents: inv.vat_cents,
+    totalCents: inv.total_cents,
+    issuedAt: inv.issued_at,
+    customerName: inv.customer_name ?? "",
+    customerPhone: inv.customer_phone ?? "",
+    lines: (items.results ?? []).map((l: any) => ({
+      name: l.name,
+      priceCents: l.price_cents,
+      quantity: l.quantity,
+      vatPct: l.vat_pct,
+    })),
+  };
+
+  const res = await submitInvoice({ ...env, ZRA_BASE_URL: baseUrl }, submission);
+  if (!res.submitted) return { synced: false, error: res.reason ?? "zra_submit_failed" };
+
+  const localQr = zraQrPayload({
+    invoiceNo: inv.invoice_no, orderId: inv.order_id, businessId: inv.business_id,
+    businessName: inv.business_name, tpin: inv.tpin, customerId: inv.customer_id,
+    customerName: inv.customer_name, customerPhone: inv.customer_phone,
+    subtotalCents: inv.subtotal_cents, vatCents: inv.vat_cents, totalCents: inv.total_cents,
+    lines: [], issuedAt: inv.issued_at,
+  });
   await db
     .prepare("UPDATE invoices SET afc_code = ?, acf_code = ?, zra_qr = ?, status = 'synced', synced_at = datetime('now') WHERE id = ?")
-    .bind(afc, acf, zraQrPayload({
-      invoiceNo: inv.invoice_no, orderId: inv.order_id, businessId: inv.business_id,
-      businessName: inv.business_name, tpin: inv.tpin, customerId: inv.customer_id,
-      customerName: inv.customer_name, customerPhone: inv.customer_phone,
-      subtotalCents: inv.subtotal_cents, vatCents: inv.vat_cents, totalCents: inv.total_cents,
-      lines: [], issuedAt: inv.issued_at,
-    }), invoiceId)
+    .bind(res.afcCode ?? null, res.acfCode ?? null, res.qr ?? localQr, invoiceId)
     .run();
-  return { synced: true, afc, acf };
+  return { synced: true, afc: res.afcCode, acf: res.acfCode };
 }

@@ -18,6 +18,39 @@ Format: [Keep a Changelog](https://keepachangelog.com/).
   200 (16 bags), website assets + SPA fallback → 200. **No code changes.**
   Prevention: always verify `GET /api/products` returns JSON after deploying
   (see AGENTS.md → Deployment).
+
+## [Unreleased] — 2026-09-27 (gap batch)
+
+### Added
+- **R2 image pipeline**: `POST /api/upload` (auth; ≤3MB; jpeg/png/webp) →
+  `grand-elephants/{folder}/…` in bucket `choa-sermons-vault`, served at
+  `https://media.churchonapp.com/…` (`IMAGES` binding in wrangler.toml).
+  One-shot `POST /api/admin/migrate-images` moves stored base64 to R2
+  (executed: 0 migrated, 18 skipped, 0 failed — no data-URIs in DB).
+- **Banner CRUD**: `GET/POST /api/admin/banners`, `PUT/DELETE
+  /api/admin/banners/:id` (admin+). **Category delete**:
+  `DELETE /api/admin/categories/:id` → 409 while products reference it.
+- **OTP lockout**: 5 failed verifies burn the code and lock the phone for
+  15 min (`OTP_LOCKOUT_MINUTES`); new `otp_lockouts` table (migration_004,
+  applied remotely). Locked → HTTP 429 on BOTH request-otp and verify-otp.
+- **ZRA Smart Invoice**: real submission client in `smart_invoice.ts`
+  (researched ZRA VSDC `POST {base}/SalesInformation/SaveSales`; base URL
+  config `ZRA_BASE_URL` → `app_settings.zra_base_url` → default sandbox
+  `https://api-sandbox.zra.org.zm/vsdc-api/v1`; auth `ZRA_AUTH_SCHEME` +
+  `ZRA_API_KEY`). Stores `afc_code`/`acf_code`/`zra_qr`/`synced_at` on
+  success, stays `issued` on failure; still gated by `zra_enabled=1` + key.
+  Production endpoint/payload must be finalized against official ZRA
+  onboarding docs (device credentials/TPIN registration not yet done).
+- **401→403**: new `forbidden()` helper; 56 role/scope/ownership failures
+  now return 403 (missing-token/OTP/webhook-auth failures stay 401).
+
+### Fixed
+- **Second secrets wipe**: foreign deployment at 12:40:51Z (source
+  `Unknown (deployment)`, 6 min after the 12:35 restore) wiped all six
+  secrets again. All re-restored from stored value sources; functional E2E
+  re-verified: request-otp 200 (SMS dispatched), verify-otp 200, /api/me
+  200, upload→R2→public URL 200, 403/409/429 semantics correct, full
+  browser login lands on Home. `LIPILA_API_KEY` remains lost.
 - **All Worker secrets were wiped** by a second, foreign deployment
   (`6841ad08`, 08:08:49Z — different config, no script/bindings) → `verify-otp`
   500 (empty `JWT_SECRET`) and silent SMS failure (missing `AT_API_KEY`).

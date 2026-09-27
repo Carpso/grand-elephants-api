@@ -8,10 +8,10 @@ import {
   checkDisbursementStatus, checkWalletBalance, LipilaEnv,
 } from "./lipila";
 import { parseSettings, computeOrderTotals, payoutNetCents, loadFeeSettings, invalidateFeeSettings, FeeSettings } from "./fees";
-import { requestOtp, verifyOtp, issueToken, authFromRequest, isSuperadminPhone, hasRole, userJson, AuthEnv } from "./auth";
+import { requestOtp, verifyOtp, issueToken, authFromRequest, isSuperadminPhone, hasRole, userJson, checkOtpLock, AuthEnv } from "./auth";
 import { sendSms } from "./sms";
 import { pushUser, pushAdmins, pushAllUsers, FirebaseEnv } from "./firebase";
-import { nextInvoiceNo, syncInvoiceToZra } from "./invoice";
+import { nextInvoiceNo, syncInvoiceToZra, zraQrPayload } from "./invoice";
 import { submitInvoice, SmartInvoiceSubmission } from "./smart_invoice";
 import { isValidCategory } from "./categories";
 import { randomHex, sha256Hex } from "./jwt";
@@ -21,6 +21,7 @@ type Env = AuthEnv &
   LipilaEnv &
   FirebaseEnv & {
     DB: D1Database;
+  IMAGES?: R2Bucket;
     APP_URL?: string;
     CORS_ORIGINS?: string;
     VAT_PCT?: string;
@@ -31,6 +32,8 @@ type Env = AuthEnv &
     LIPILA_DISBURSEMENT_FEE_PCT?: string;
     CARD_LIPILA_COLLECTION_FEE_PCT?: string;
     ZRA_API_KEY?: string;
+    ZRA_BASE_URL?: string;
+    ZRA_AUTH_SCHEME?: string;
   };
 
 const app = new Hono<{ Bindings: Env }>();
@@ -43,6 +46,7 @@ app.use("*", cors({ origin: "*", allowMethods: ["GET", "POST", "PUT", "PATCH", "
 const json = (c: any, data: unknown, status = 200) => c.json(data, status);
 const badRequest = (c: any, message: string) => json(c, { error: message }, 400);
 const unauthorized = (c: any, message = "Unauthorized") => json(c, { error: message }, 401);
+const forbidden = (c: any, message = "Forbidden") => json(c, { error: message }, 403);
 const notFound = (c: any, message = "Not found") => json(c, { error: message }, 404);
 
 async function body(c: any): Promise<any> {
@@ -59,6 +63,14 @@ function makeOrderId(): string {
 
 function normPhone(p: string): string {
   return p.replace(/\D/g, "").replace(/^0/, "260").replace(/^260/, "260").replace(/^\+/, "");
+}
+
+/** 429 response while a phone is locked out after too many failed OTP attempts. */
+function otpLocked(c: any, lockedUntil: string): Response {
+  const untilMs = Date.parse(`${lockedUntil.replace(" ", "T")}Z`);
+  const remainingMs = Number.isFinite(untilMs) ? untilMs - Date.now() : 0;
+  const minutes = Math.max(1, Math.ceil(remainingMs / 60000));
+  return json(c, { error: `Too many attempts. Try again in ${minutes} minutes.` }, 429);
 }
 
 async function getBusiness(db: D1Database, id: number) {
@@ -217,6 +229,75 @@ async function logAction(db: D1Database, adminUserId: number | null, action: str
     .bind(adminUserId, action, entityType, entityId, details ? JSON.stringify(details) : null).run();
 }
 
+// ---------- image uploads (R2) ----------
+
+const IMAGE_FOLDERS = ["products", "riders", "profiles", "banners", "deliveries", "misc"];
+const IMAGE_MIME_EXT: Record<string, string> = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp" };
+const MAX_IMAGE_BYTES = 3 * 1024 * 1024;
+const MEDIA_BASE_URL = "https://media.churchonapp.com/";
+
+type ImageDecode =
+  | { ok: true; mime: string; ext: string; bytes: Uint8Array }
+  | { ok: false; status: number; error: string };
+
+function decodeImageDataUri(dataUri: unknown): ImageDecode {
+  if (typeof dataUri !== "string" || !dataUri.startsWith("data:")) {
+    return { ok: false, status: 400, error: "dataUri must be a base64 data URI (data:<mime>;base64,...)" };
+  }
+  const m = /^data:([^;,]+);base64,([\s\S]+)$/.exec(dataUri);
+  if (!m) return { ok: false, status: 400, error: "dataUri must be base64-encoded (data:<mime>;base64,...)" };
+  const mime = m[1].trim().toLowerCase();
+  const ext = IMAGE_MIME_EXT[mime];
+  if (!ext) return { ok: false, status: 415, error: "Only image/jpeg, image/png and image/webp are supported" };
+  let b64 = m[2].replace(/\s+/g, "");
+  while (b64.length % 4) b64 += "=";
+  // Cheap size gate before decoding (base64 is 4 chars per 3 bytes).
+  if (Math.floor((b64.length * 3) / 4) > MAX_IMAGE_BYTES) {
+    return { ok: false, status: 413, error: "Image exceeds the 3 MB limit" };
+  }
+  let bytes: Uint8Array;
+  try {
+    const bin = atob(b64);
+    bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  } catch {
+    return { ok: false, status: 400, error: "dataUri contains invalid base64" };
+  }
+  if (bytes.length > MAX_IMAGE_BYTES) return { ok: false, status: 413, error: "Image exceeds the 3 MB limit" };
+  return { ok: true, mime, ext, bytes };
+}
+
+/** Store a base64 image data URI in R2 under grand-elephants/{folder}/... */
+async function putImageDataUri(
+  env: Env,
+  dataUri: unknown,
+  folderRaw: unknown
+): Promise<{ ok: true; key: string; url: string } | { ok: false; status: number; error: string }> {
+  if (!env.IMAGES) {
+    return { ok: false, status: 500, error: "Image storage is not configured (missing IMAGES R2 binding)" };
+  }
+  const folder = typeof folderRaw === "string" && folderRaw.trim() ? folderRaw.trim() : "misc";
+  if (!IMAGE_FOLDERS.includes(folder)) {
+    return { ok: false, status: 400, error: `folder must be one of: ${IMAGE_FOLDERS.join(", ")}` };
+  }
+  const decoded = decodeImageDataUri(dataUri);
+  if (!decoded.ok) return decoded;
+  const key = `grand-elephants/${folder}/${Date.now()}-${randomHex(8)}.${decoded.ext}`;
+  await env.IMAGES.put(key, decoded.bytes, { httpMetadata: { contentType: decoded.mime } });
+  return { ok: true, key, url: MEDIA_BASE_URL + key };
+}
+
+/** Every TEXT column that can hold an image (schema.sql), with its R2 folder. */
+const IMAGE_COLUMNS: { table: string; column: string; folder: string }[] = [
+  { table: "users", column: "profile_photo", folder: "profiles" },
+  { table: "users", column: "bike_photo", folder: "riders" },
+  { table: "products", column: "image", folder: "products" },
+  { table: "orders", column: "proof_photo", folder: "deliveries" },
+  { table: "order_items", column: "image", folder: "products" },
+  { table: "businesses", column: "logo", folder: "profiles" },
+  { table: "banners", column: "image", folder: "banners" },
+];
+
 /** Marks an order paid, credits the business wallet, creates the ZRA invoice. Idempotent. */
 async function confirmOrder(db: D1Database, env: Env, orderId: string, transactionId?: string) {
   const order = await db.prepare("SELECT * FROM orders WHERE id = ?").bind(orderId).first<any>();
@@ -250,24 +331,51 @@ async function confirmOrder(db: D1Database, env: Env, orderId: string, transacti
   }
   if (biz?.tpin) {
     await db.prepare("UPDATE invoices SET tp_in = ? WHERE id = ?").bind(biz.tpin, inv.meta.last_row_id).run();
-    await syncInvoiceToZra(db, env, inv.meta.last_row_id);
   }
 
-  // ZRA SmartInvoice submission seam (no-op stub until credentials exist).
+  // ZRA SmartInvoice submission: real push when app_settings.zra_enabled = '1'
+  // (the syncInvoiceToZra gate). Stores AFC/ACF codes + QR and marks the
+  // invoice 'synced' on success; it stays 'issued' on failure. The admin
+  // manual resync endpoint re-uses syncInvoiceToZra for retries.
   try {
-    const submission: SmartInvoiceSubmission = {
-      invoiceId: Number(inv.meta.last_row_id),
-      invoiceNo,
-      orderId,
-      businessId: order.business_id,
-      buyerTpin: order.buyer_tpin ?? "",
-      sellerTpin: biz?.tpin ?? "",
-      subtotalCents: order.subtotal_cents,
-      vatCents: order.vat_cents,
-      totalCents: order.total_cents,
-      issuedAt: order.created_at ?? new Date().toISOString(),
-    };
-    await submitInvoice(env, submission);
+    const zraEnabled = (await db.prepare("SELECT value FROM app_settings WHERE key = 'zra_enabled'").first<{ value: string }>())?.value === "1";
+    if (!zraEnabled) {
+      console.log(`[smart_invoice] skipped ${invoiceNo} (order ${orderId}): zra_enabled is not 1`);
+    } else {
+      const invoiceId = Number(inv.meta.last_row_id);
+      const submission: SmartInvoiceSubmission = {
+        invoiceId,
+        invoiceNo,
+        orderId,
+        businessId: order.business_id,
+        buyerTpin: order.buyer_tpin ?? "",
+        sellerTpin: biz?.tpin ?? "",
+        subtotalCents: order.subtotal_cents,
+        vatCents: order.vat_cents,
+        totalCents: order.total_cents,
+        issuedAt: order.created_at ?? new Date().toISOString(),
+        customerPhone: order.customer_phone ?? "",
+        lines: (lines.results ?? []).map((l) => ({
+          name: l.name,
+          priceCents: l.price_cents,
+          quantity: l.quantity,
+          vatPct: feeSettings.vatPct,
+        })),
+      };
+      const res = await submitInvoice(env, submission);
+      if (res.submitted) {
+        const qr = res.qr ?? zraQrPayload({
+          invoiceNo, orderId, businessId: order.business_id, businessName: biz?.name ?? "",
+          tpin: biz?.tpin ?? "", customerId: order.user_id, customerName: "",
+          customerPhone: order.customer_phone ?? "", subtotalCents: order.subtotal_cents,
+          vatCents: order.vat_cents, totalCents: order.total_cents, lines: [],
+          issuedAt: order.created_at ?? new Date().toISOString(),
+        });
+        await db.prepare(
+          "UPDATE invoices SET afc_code = ?, acf_code = ?, zra_qr = ?, status = 'synced', synced_at = datetime('now') WHERE id = ?"
+        ).bind(res.afcCode ?? null, res.acfCode ?? null, qr, invoiceId).run();
+      }
+    }
   } catch (e) {
     console.error("smart_invoice submission failed:", e);
   }
@@ -295,7 +403,10 @@ app.get("/api/health", (c) => json(c, { ok: true, service: "grand-elephants-api"
 app.post("/api/auth/request-otp", async (c) => {
   const { phone } = await body(c);
   if (!phone) return badRequest(c, "phone is required");
-  const res = await requestOtp(c.env.DB, c.env, normPhone(phone));
+  const p = normPhone(phone);
+  const locked = await checkOtpLock(c.env.DB, p);
+  if (locked) return otpLocked(c, locked);
+  const res = await requestOtp(c.env.DB, c.env, p);
   return json(c, { ok: res.ok, ...(res.debugCode ? { debugCode: res.debugCode } : {}) });
 });
 
@@ -303,7 +414,9 @@ app.post("/api/auth/verify-otp", async (c) => {
   const { phone, code, name, email, role, fcmToken } = await body(c);
   const p = normPhone(phone ?? "");
   if (!p || !code) return badRequest(c, "phone and code are required");
-  const ok = await verifyOtp(c.env.DB, p, String(code).trim());
+  const locked = await checkOtpLock(c.env.DB, p);
+  if (locked) return otpLocked(c, locked);
+  const ok = await verifyOtp(c.env.DB, p, String(code).trim(), c.env);
   if (!ok) return unauthorized(c, "Invalid or expired code");
 
   let user = await c.env.DB.prepare("SELECT * FROM users WHERE phone = ?").bind(p).first<any>();
@@ -659,7 +772,7 @@ app.get("/api/orders/:id", async (c) => {
   if (!a) return unauthorized(c);
   const row = await c.env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(c.req.param("id")).first<any>();
   if (!row) return notFound(c, "Order not found");
-  if (!await canViewOrder(c.env.DB, a, row)) return unauthorized(c, "Not your order");
+  if (!await canViewOrder(c.env.DB, a, row)) return forbidden(c, "Not your order");
   return json(c, { order: await orderJson(c.env.DB, row) });
 });
 
@@ -678,7 +791,7 @@ app.get("/api/orders/:id/receipt", async (c) => {
   if (!a) return unauthorized(c);
   const row = await c.env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(c.req.param("id")).first<any>();
   if (!row) return notFound(c, "Order not found");
-  if (!await canViewOrder(c.env.DB, a, row)) return unauthorized(c, "Not your order");
+  if (!await canViewOrder(c.env.DB, a, row)) return forbidden(c, "Not your order");
 
   const [biz, buyer, invoice, items, rider, feeSettings] = await Promise.all([
     c.env.DB.prepare("SELECT id, name, address, tpin FROM businesses WHERE id = ?").bind(row.business_id).first<any>(),
@@ -798,7 +911,8 @@ app.get("/api/businesses/:id", async (c) => {
 
 app.put("/api/businesses/me", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !a.user.business_id) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!a.user.business_id) return forbidden(c);
   const b = await body(c);
   const sets: string[] = [];
   const vals: unknown[] = [];
@@ -815,7 +929,7 @@ app.get("/api/businesses/me/collection-numbers", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a) return unauthorized(c);
   const businessId = await businessScope(c.env.DB, a, { businessId: c.req.query("businessId") });
-  if (businessId == null) return unauthorized(c, "No business");
+  if (businessId == null) return forbidden(c, "No business");
   const rows = await c.env.DB.prepare("SELECT * FROM collection_numbers WHERE business_id = ? ORDER BY is_default DESC, id DESC").bind(businessId).all<any>();
   return json(c, (rows.results ?? []).map((n) => ({
     id: String(n.id), businessName: n.business_name, businessId: String(n.business_id),
@@ -830,7 +944,7 @@ app.post("/api/businesses/me/collection-numbers", async (c) => {
   if (!a) return unauthorized(c);
   const b = await body(c);
   const businessId = await businessScope(c.env.DB, a, b);
-  if (businessId == null) return unauthorized(c, "No business");
+  if (businessId == null) return forbidden(c, "No business");
   if (!b.phoneNumber || !b.network) return badRequest(c, "phoneNumber and network are required");
   const networks = ["mtn", "airtel", "zamtel"];
   if (!networks.includes(b.network)) return badRequest(c, "network must be mtn, airtel or zamtel");
@@ -852,7 +966,7 @@ app.put("/api/businesses/me/collection-numbers/:id", async (c) => {
   if (!a) return unauthorized(c);
   const b = await body(c);
   const businessId = await businessScope(c.env.DB, a, b);
-  if (businessId == null) return unauthorized(c, "No business");
+  if (businessId == null) return forbidden(c, "No business");
   const sets: string[] = [];
   const vals: unknown[] = [];
   for (const [field, col] of [["network", "network"], ["phoneNumber", "phone_number"], ["tillNumber", "till_number"], ["businessName", "business_name"]] as const) {
@@ -873,7 +987,7 @@ app.delete("/api/businesses/me/collection-numbers/:id", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a) return unauthorized(c);
   const businessId = await businessScope(c.env.DB, a, { businessId: c.req.query("businessId") });
-  if (businessId == null) return unauthorized(c, "No business");
+  if (businessId == null) return forbidden(c, "No business");
   await c.env.DB.prepare("DELETE FROM collection_numbers WHERE business_id = ? AND id = ?").bind(businessId, Number(c.req.param("id"))).run();
   return json(c, { ok: true });
 });
@@ -884,7 +998,7 @@ app.get("/api/businesses/me/products", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a) return unauthorized(c);
   const businessId = await businessScope(c.env.DB, a, { businessId: c.req.query("businessId") });
-  if (businessId == null) return unauthorized(c, "No business");
+  if (businessId == null) return forbidden(c, "No business");
   const rows = await c.env.DB.prepare("SELECT * FROM products WHERE business_id = ? ORDER BY id DESC").bind(businessId).all<any>();
   return json(c, (rows.results ?? []).map(productJson));
 });
@@ -894,7 +1008,7 @@ app.post("/api/businesses/me/products", async (c) => {
   if (!a) return unauthorized(c);
   const b = await body(c);
   const businessId = await businessScope(c.env.DB, a, b);
-  if (businessId == null) return unauthorized(c, "No business");
+  if (businessId == null) return forbidden(c, "No business");
   if (!b.name || !b.price) return badRequest(c, "name and price are required");
   const priceCents = Math.round(Number(b.price) * 100);
   if (!Number.isFinite(priceCents) || priceCents <= 0) return badRequest(c, "invalid price");
@@ -912,7 +1026,7 @@ app.put("/api/businesses/me/products/:id", async (c) => {
   if (!a) return unauthorized(c);
   const b = await body(c);
   const businessId = await businessScope(c.env.DB, a, b);
-  if (businessId == null) return unauthorized(c, "No business");
+  if (businessId == null) return forbidden(c, "No business");
   const sets: string[] = [];
   const vals: unknown[] = [];
   const fields: [string, string][] = [["name", "name"], ["image", "image"], ["description", "description"], ["category", "category"]];
@@ -931,7 +1045,7 @@ app.delete("/api/businesses/me/products/:id", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a) return unauthorized(c);
   const businessId = await businessScope(c.env.DB, a, { businessId: c.req.query("businessId") });
-  if (businessId == null) return unauthorized(c, "No business");
+  if (businessId == null) return forbidden(c, "No business");
   await c.env.DB.prepare("UPDATE products SET active = 0, updated_at = datetime('now') WHERE business_id = ? AND id = ?")
     .bind(businessId, Number(c.req.param("id"))).run();
   return json(c, { ok: true });
@@ -941,7 +1055,8 @@ app.delete("/api/businesses/me/products/:id", async (c) => {
 
 app.get("/api/businesses/me/orders", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !a.user.business_id) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!a.user.business_id) return forbidden(c);
   const { status } = c.req.query();
   let sql = "SELECT * FROM orders WHERE business_id = ?";
   const vals: unknown[] = [a.user.business_id];
@@ -961,7 +1076,7 @@ app.post("/api/businesses/me/orders/:id/status", async (c) => {
   const b = await body(c);
   const order = await c.env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(c.req.param("id")).first<any>();
   if (!order) return notFound(c, "Order not found");
-  if (!await canManageBusiness(c.env.DB, a.id, order.business_id)) return unauthorized(c, "Not your order");
+  if (!await canManageBusiness(c.env.DB, a.id, order.business_id)) return forbidden(c, "Not your order");
   const status = b.status;
   if (!VALID_STATUSES.includes(status)) return badRequest(c, `status must be one of: ${VALID_STATUSES.join(", ")}`);
 
@@ -997,7 +1112,8 @@ app.post("/api/businesses/me/orders/:id/status", async (c) => {
 
 app.post("/api/businesses/me/staff", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !a.user.business_id) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!a.user.business_id) return forbidden(c);
   const b = await body(c);
   const phone = normPhone(b.phone ?? "");
   if (!phone) return badRequest(c, "phone is required");
@@ -1021,7 +1137,8 @@ app.post("/api/businesses/me/staff", async (c) => {
 
 app.get("/api/businesses/me/riders", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !a.user.business_id) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!a.user.business_id) return forbidden(c);
   const rows = await c.env.DB.prepare("SELECT * FROM riders WHERE business_id = ? ORDER BY status, joined DESC").bind(a.user.business_id).all<any>();
   return json(c, (rows.results ?? []).map((r) => ({
     id: String(r.id), userId: String(r.user_id), name: r.name, phone: r.phone, vehicle: r.vehicle,
@@ -1031,7 +1148,8 @@ app.get("/api/businesses/me/riders", async (c) => {
 
 app.post("/api/businesses/me/riders", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !a.user.business_id) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!a.user.business_id) return forbidden(c);
   const b = await body(c);
   const phone = normPhone(b.phone ?? "");
   if (!phone) return badRequest(c, "phone is required");
@@ -1052,7 +1170,8 @@ app.post("/api/businesses/me/riders", async (c) => {
 
 app.post("/api/businesses/me/riders/:id/status", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !a.user.business_id) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!a.user.business_id) return forbidden(c);
   const b = await body(c);
   if (!["approved", "suspended"].includes(b.status)) return badRequest(c, "status must be approved or suspended");
   await c.env.DB.prepare("UPDATE riders SET status = ?, updated_at = datetime('now') WHERE id = ? AND business_id = ?")
@@ -1128,7 +1247,7 @@ async function riderOrderStatus(c: Ctx) {
   const order = await c.env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(c.req.param("id")).first<any>();
   if (!order) return notFound(c, "Order not found");
   const rider = await c.env.DB.prepare("SELECT id FROM riders WHERE id = ? AND user_id = ?").bind(order.rider_id, a.id).first<any>();
-  if (!rider) return unauthorized(c, "Not assigned to you");
+  if (!rider) return forbidden(c, "Not assigned to you");
   if (!["Out for Delivery", "Delivered"].includes(b.status)) return badRequest(c, "status must be Out for Delivery or Delivered");
   const proofPhoto = typeof b.proofPhoto === "string" && b.proofPhoto.trim() ? String(b.proofPhoto) : null;
   const photoSet = proofPhoto ? ", proof_photo = ?" : "";
@@ -1282,7 +1401,8 @@ app.post("/api/products/:id/reviews", async (c) => {
 
 app.get("/api/admin/riders", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const rows = await c.env.DB.prepare(
     `SELECT r.*, b.name AS business_name, u.phone AS user_phone, u.rider_status AS user_rider_status
      FROM riders r JOIN businesses b ON b.id = r.business_id JOIN users u ON u.id = r.user_id
@@ -1297,7 +1417,8 @@ app.get("/api/admin/riders", async (c) => {
 
 app.get("/api/admin/rider-applications", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const rows = await c.env.DB.prepare(
     "SELECT id, uid, name, phone, bike_photo, rider_status, created_at FROM users WHERE rider_status = 'pending' ORDER BY id DESC"
   ).all<any>();
@@ -1308,7 +1429,8 @@ app.get("/api/admin/rider-applications", async (c) => {
 
 app.post("/api/admin/rider-applications/:id/approve", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const id = Number(c.req.param("id"));
   const u = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(id).first<any>();
   if (!u) return notFound(c, "User not found");
@@ -1333,7 +1455,8 @@ app.post("/api/admin/rider-applications/:id/approve", async (c) => {
 
 app.post("/api/admin/riders/:id/status", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const b = await body(c);
   if (!["approved", "suspended", "rejected"].includes(b.status)) return badRequest(c, "status must be approved, suspended or rejected");
   const riderId = Number(c.req.param("id"));
@@ -1352,7 +1475,8 @@ app.post("/api/admin/riders/:id/status", async (c) => {
 
 app.get("/api/admin/rider-payouts", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const rows = await c.env.DB.prepare(
     `SELECT p.*, r.name AS rider_name, r.phone AS rider_phone, b.name AS business_name
      FROM rider_payouts p JOIN riders r ON r.id = p.rider_id JOIN businesses b ON b.id = p.business_id
@@ -1367,7 +1491,8 @@ app.get("/api/admin/rider-payouts", async (c) => {
 
 app.post("/api/admin/riders/:id/payout", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const rider = await c.env.DB.prepare("SELECT * FROM riders WHERE id = ?").bind(Number(c.req.param("id"))).first<any>();
   if (!rider) return notFound(c, "Rider not found");
   if (rider.balance_cents < 2000) return badRequest(c, "Rider balance must be at least K20 to pay out");
@@ -1408,7 +1533,8 @@ app.post("/api/admin/riders/:id/payout", async (c) => {
 // admin Lipila wallet access (Grand Elephants wallet)
 app.get("/api/admin/lipila/balance", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   try {
     const res = await checkWalletBalance(c.env);
     const wallet = await c.env.DB.prepare("SELECT COALESCE(SUM(balance_cents),0) AS bal FROM wallets").first<any>();
@@ -1422,7 +1548,8 @@ app.get("/api/admin/lipila/balance", async (c) => {
 
 const businessPayoutHandler = async (c: Ctx) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !a.user.business_id) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!a.user.business_id) return forbidden(c);
   const wallet = await c.env.DB.prepare("SELECT * FROM wallets WHERE business_id = ?").bind(a.user.business_id).first<any>();
   if (!wallet || wallet.balance_cents < 5000) return badRequest(c, "Minimum payout is K50");
   const numbers = await c.env.DB.prepare("SELECT * FROM collection_numbers WHERE business_id = ? AND is_active = 1 ORDER BY is_default DESC").bind(a.user.business_id).first<any>();
@@ -1470,7 +1597,8 @@ app.post("/api/businesses/me/payouts", businessPayoutHandler);
 
 const businessPayoutListHandler = async (c: Ctx) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !a.user.business_id) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!a.user.business_id) return forbidden(c);
   const rows = await c.env.DB.prepare("SELECT * FROM payouts WHERE business_id = ? ORDER BY created_at DESC LIMIT 50").bind(a.user.business_id).all<any>();
   return json(c, (rows.results ?? []).map((p) => ({
     id: String(p.id), amount: p.amount_cents / 100, amountCents: p.amount_cents,
@@ -1493,7 +1621,7 @@ app.get("/api/businesses/me/tax", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a) return unauthorized(c);
   const businessId = await businessScope(c.env.DB, a, { businessId: c.req.query("businessId") });
-  if (businessId == null) return unauthorized(c, "No business");
+  if (businessId == null) return forbidden(c, "No business");
   const feeSettings = await loadFeeSettings(c.env.DB, feeEnvRaw(c.env));
   const from = c.req.query("from") ?? "";
   const to = c.req.query("to") ?? "";
@@ -1544,7 +1672,7 @@ app.get("/api/businesses/me/tax/payments", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a) return unauthorized(c);
   const businessId = await businessScope(c.env.DB, a, { businessId: c.req.query("businessId") });
-  if (businessId == null) return unauthorized(c, "No business");
+  if (businessId == null) return forbidden(c, "No business");
   const rows = await c.env.DB.prepare("SELECT * FROM tax_payments WHERE business_id = ? ORDER BY id DESC LIMIT 100")
     .bind(businessId).all<any>();
   return json(c, (rows.results ?? []).map((p) => ({
@@ -1564,7 +1692,7 @@ app.post("/api/businesses/me/tax/payments", async (c) => {
   if (!a) return unauthorized(c);
   const b = await body(c);
   const businessId = await businessScope(c.env.DB, a, b);
-  if (businessId == null) return unauthorized(c, "No business");
+  if (businessId == null) return forbidden(c, "No business");
   const amountCents = b.amountCents !== undefined ? Math.round(Number(b.amountCents)) : Math.round(Number(b.amount) * 100);
   if (!Number.isFinite(amountCents) || amountCents <= 0) return badRequest(c, "amountCents must be a positive integer");
   const periodStart = b.periodStart;
@@ -1599,13 +1727,27 @@ app.get("/api/invoices/mine", async (c) => {
   })));
 });
 
+// ---------- image upload (R2) ----------
+
+// Stores a base64 image data URI in R2 and returns its CDN URL. The Flutter
+// app uploads before saving profile photos / product images / banners.
+app.post("/api/upload", async (c) => {
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
+  if (!a) return unauthorized(c);
+  const b = await body(c);
+  const res = await putImageDataUri(c.env, b.dataUri, b.folder);
+  if (!res.ok) return json(c, { error: res.error }, res.status);
+  return json(c, { url: res.url });
+});
+
 // ---------- admin ----------
 
 // admin product management (any product, any business)
 
 app.get("/api/admin/products", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const businessId = Number(c.req.query("businessId"));
   let sql = "SELECT p.*, b.name AS business_name FROM products p JOIN businesses b ON b.id = p.business_id";
   const vals: unknown[] = [];
@@ -1617,7 +1759,8 @@ app.get("/api/admin/products", async (c) => {
 
 app.post("/api/admin/products", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const b = await body(c);
   if (!b.name || !b.price) return badRequest(c, "name and price are required");
   const priceCents = Math.round(Number(b.price) * 100);
@@ -1644,7 +1787,8 @@ app.post("/api/admin/products", async (c) => {
 
 app.put("/api/admin/products/:id", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const id = Number(c.req.param("id"));
   const existing = await c.env.DB.prepare("SELECT id FROM products WHERE id = ?").bind(id).first<any>();
   if (!existing) return notFound(c, "Product not found");
@@ -1677,7 +1821,8 @@ app.put("/api/admin/products/:id", async (c) => {
 
 app.delete("/api/admin/products/:id", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const id = Number(c.req.param("id"));
   const existing = await c.env.DB.prepare("SELECT id FROM products WHERE id = ?").bind(id).first<any>();
   if (!existing) return notFound(c, "Product not found");
@@ -1688,7 +1833,8 @@ app.delete("/api/admin/products/:id", async (c) => {
 
 app.get("/api/admin/stats", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const [users, businesses, orders, products, pendingBiz, pendingPay, wallet] = await Promise.all([
     c.env.DB.prepare("SELECT COUNT(*) AS n FROM users").first<any>(),
     c.env.DB.prepare("SELECT COUNT(*) AS n FROM businesses").first<any>(),
@@ -1711,7 +1857,8 @@ app.get("/api/admin/stats", async (c) => {
 
 app.get("/api/admin/users", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const q = c.req.query("q") ?? "";
   let sql = "SELECT * FROM users";
   const vals: unknown[] = [];
@@ -1723,7 +1870,8 @@ app.get("/api/admin/users", async (c) => {
 
 app.patch("/api/admin/users/:id", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const b = await body(c);
   const id = Number(c.req.param("id"));
   const sets: string[] = [];
@@ -1753,7 +1901,8 @@ app.patch("/api/admin/users/:id", async (c) => {
 
 app.get("/api/admin/businesses", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const rows = await c.env.DB.prepare(
     `SELECT b.*, u.name AS owner_name, u.phone AS owner_phone FROM businesses b JOIN users u ON u.id = b.owner_user_id ORDER BY b.created_at DESC LIMIT 200`
   ).all<any>();
@@ -1766,7 +1915,8 @@ app.get("/api/admin/businesses", async (c) => {
 
 app.post("/api/admin/businesses/:id/status", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const b = await body(c);
   if (!["pending", "approved", "suspended"].includes(b.status)) return badRequest(c, "invalid status");
   const id = Number(c.req.param("id"));
@@ -1788,7 +1938,8 @@ app.post("/api/admin/businesses/:id/status", async (c) => {
 
 app.get("/api/admin/orders", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const { status } = c.req.query();
   let sql = "SELECT * FROM orders";
   const vals: unknown[] = [];
@@ -1802,7 +1953,8 @@ app.get("/api/admin/orders", async (c) => {
 
 app.get("/api/admin/payouts", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const rows = await c.env.DB.prepare(
     `SELECT p.*, b.name AS business_name FROM payouts p JOIN businesses b ON b.id = p.business_id ORDER BY p.created_at DESC LIMIT 100`
   ).all<any>();
@@ -1815,7 +1967,8 @@ app.get("/api/admin/payouts", async (c) => {
 
 app.post("/api/admin/payouts/:id/process", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const payout = await c.env.DB.prepare("SELECT * FROM payouts WHERE id = ?").bind(Number(c.req.param("id"))).first<any>();
   if (!payout) return notFound(c, "Payout not found");
   if (!payout.lipila_reference) return badRequest(c, "No Lipila reference — create a new payout");
@@ -1830,21 +1983,24 @@ app.post("/api/admin/payouts/:id/process", async (c) => {
 
 app.get("/api/admin/lipila-logs", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const rows = await c.env.DB.prepare("SELECT * FROM lipila_logs ORDER BY id DESC LIMIT 200").all<any>();
   return json(c, rows.results ?? []);
 });
 
 app.get("/api/admin/actions", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const rows = await c.env.DB.prepare("SELECT * FROM admin_actions ORDER BY id DESC LIMIT 200").all<any>();
   return json(c, rows.results ?? []);
 });
 
 app.get("/api/admin/invoices", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const rows = await c.env.DB.prepare(
     `SELECT i.*, b.name AS business_name FROM invoices i JOIN businesses b ON b.id = i.business_id ORDER BY i.id DESC LIMIT 200`
   ).all<any>();
@@ -1857,21 +2013,24 @@ app.get("/api/admin/invoices", async (c) => {
 
 app.post("/api/admin/invoices/:id/sync-zra", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const res = await syncInvoiceToZra(c.env.DB, c.env, Number(c.req.param("id")));
   return json(c, res);
 });
 
 app.get("/api/admin/settings", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const rows = await c.env.DB.prepare("SELECT key, value FROM app_settings").all<any>();
   return json(c, Object.fromEntries((rows.results ?? []).map((r) => [r.key, r.value])));
 });
 
 app.patch("/api/admin/settings", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const b = await body(c);
   for (const [k, v] of Object.entries(b)) {
     if (typeof v !== "string" && typeof v !== "number") continue;
@@ -1885,19 +2044,121 @@ app.patch("/api/admin/settings", async (c) => {
 
 app.get("/api/admin/categories", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const rows = await c.env.DB.prepare("SELECT * FROM categories ORDER BY id").all<any>();
   return json(c, (rows.results ?? []).map((r) => ({ id: String(r.id), name: r.name, icon: r.icon, enabled: r.enabled === 1 })));
 });
 
 app.post("/api/admin/categories", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
-  if (!a || !hasRole(a.user, "admin", "superadmin")) return unauthorized(c);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const b = await body(c);
   if (!b.name) return badRequest(c, "name is required");
   const r = await c.env.DB.prepare("INSERT INTO categories (name, icon, enabled) VALUES (?, ?, 1) ON CONFLICT(name) DO NOTHING")
     .bind(String(b.name), b.icon ?? "🛍️").run();
   return json(c, { ok: true, id: String(r.meta.last_row_id) }, 201);
+});
+
+// One-off: move every stored base64 image data URI into R2 and replace it with
+// the CDN URL. Values that are already http(s)/assets URLs are left untouched.
+app.post("/api/admin/migrate-images", async (c) => {
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
+  if (!c.env.IMAGES) {
+    return json(c, { error: "Image storage is not configured (missing IMAGES R2 binding)" }, 500);
+  }
+  let migrated = 0;
+  let skipped = 0;
+  let failed = 0;
+  for (const col of IMAGE_COLUMNS) {
+    const rows = await c.env.DB.prepare(
+      `SELECT id, ${col.column} AS img FROM ${col.table} WHERE ${col.column} IS NOT NULL AND ${col.column} != ''`
+    ).all<any>();
+    for (const row of rows.results ?? []) {
+      const value = String(row.img ?? "");
+      if (!value.startsWith("data:")) { skipped++; continue; }
+      const res = await putImageDataUri(c.env, value, col.folder);
+      if (!res.ok) { failed++; continue; }
+      await c.env.DB.prepare(`UPDATE ${col.table} SET ${col.column} = ? WHERE id = ?`).bind(res.url, row.id).run();
+      migrated++;
+    }
+  }
+  await logAction(c.env.DB, a.id, "images_migrated", "image", null, { migrated, skipped, failed });
+  return json(c, { ok: true, migrated, skipped, failed });
+});
+
+// banner CRUD (admin)
+
+app.get("/api/admin/banners", async (c) => {
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
+  const rows = await c.env.DB.prepare("SELECT * FROM banners ORDER BY id DESC").all<any>();
+  return json(c, rows.results ?? []);
+});
+
+app.post("/api/admin/banners", async (c) => {
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
+  const b = await body(c);
+  const r = await c.env.DB.prepare(
+    "INSERT INTO banners (title, subtitle, image, link, active) VALUES (?, ?, ?, ?, ?)"
+  ).bind(b.title ?? "", b.subtitle ?? "", b.image ?? "", b.link ?? "",
+    b.active === undefined || b.active === null ? 1 : b.active ? 1 : 0).run();
+  const row = await c.env.DB.prepare("SELECT * FROM banners WHERE id = ?").bind(r.meta.last_row_id).first<any>();
+  return json(c, row, 201);
+});
+
+app.put("/api/admin/banners/:id", async (c) => {
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
+  const id = Number(c.req.param("id"));
+  const existing = await c.env.DB.prepare("SELECT id FROM banners WHERE id = ?").bind(id).first<any>();
+  if (!existing) return notFound(c, "Banner not found");
+  const b = await body(c);
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  for (const [field, col] of [["title", "title"], ["subtitle", "subtitle"], ["image", "image"], ["link", "link"]] as const) {
+    if (b[field] !== undefined) { sets.push(`${col} = ?`); vals.push(String(b[field])); }
+  }
+  if (b.active !== undefined) { sets.push("active = ?"); vals.push(b.active ? 1 : 0); }
+  if (!sets.length) return badRequest(c, "nothing to update");
+  vals.push(id);
+  await c.env.DB.prepare(`UPDATE banners SET ${sets.join(", ")} WHERE id = ?`).bind(...vals).run();
+  const row = await c.env.DB.prepare("SELECT * FROM banners WHERE id = ?").bind(id).first<any>();
+  return json(c, row);
+});
+
+app.delete("/api/admin/banners/:id", async (c) => {
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
+  const id = Number(c.req.param("id"));
+  const existing = await c.env.DB.prepare("SELECT id FROM banners WHERE id = ?").bind(id).first<any>();
+  if (!existing) return notFound(c, "Banner not found");
+  await c.env.DB.prepare("DELETE FROM banners WHERE id = ?").bind(id).run();
+  return json(c, { ok: true });
+});
+
+app.delete("/api/admin/categories/:id", async (c) => {
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
+  const id = Number(c.req.param("id"));
+  const cat = await c.env.DB.prepare("SELECT id, name FROM categories WHERE id = ?").bind(id).first<any>();
+  if (!cat) return notFound(c, "Category not found");
+  const used = await c.env.DB.prepare("SELECT COUNT(*) AS n FROM products WHERE category = ?").bind(cat.name).first<any>();
+  if (Number(used?.n ?? 0) > 0) {
+    return json(c, { error: `Cannot delete category "${cat.name}": products exist in this category` }, 409);
+  }
+  await c.env.DB.prepare("DELETE FROM categories WHERE id = ?").bind(id).run();
+  await logAction(c.env.DB, a.id, "category_deleted", "category", String(id), { name: cat.name });
+  return json(c, { ok: true });
 });
 
 // ---------- Lipila webhook ----------

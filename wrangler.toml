@@ -13,6 +13,11 @@ binding = "DB"
 database_name = "grand-elephants-db"
 database_id = "447d1f6c-1b73-4bfd-bea5-3747460acdfc"
 
+# R2 bucket for uploaded images (profile photos, product images, banners, ...).
+[[r2_buckets]]
+binding = "IMAGES"
+bucket_name = "choa-sermons-vault"
+
 # Website: Grand Elephants Flutter web build. Served by the Worker
 # as a fallback; client-side routes fall back to index.html (SPA). Same worker
 # URL serves both the JSON API (/api/*) and the website (everything else).

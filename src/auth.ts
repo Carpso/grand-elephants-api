@@ -6,6 +6,7 @@ import type { SmsEnv } from "./sms";
 export interface AuthEnv extends SmsEnv {
   JWT_SECRET: string;
   OTP_TTL_MINUTES?: string;
+  OTP_LOCKOUT_MINUTES?: string;
   SUPERADMIN_PHONES?: string;
 }
 
@@ -13,6 +14,54 @@ const SUPERADMIN_ROLES = new Set(["superadmin", "admin"]);
 
 /** Failed attempts allowed per OTP code before it is burned (brute-force cap). */
 const MAX_OTP_ATTEMPTS = 5;
+
+/** Phone lockout after the code is burned (OTP_LOCKOUT_MINUTES env, default 15). */
+const DEFAULT_OTP_LOCKOUT_MINUTES = 15;
+
+function otpLockoutMinutes(env?: AuthEnv): number {
+  const n = Number(env?.OTP_LOCKOUT_MINUTES ?? DEFAULT_OTP_LOCKOUT_MINUTES);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_OTP_LOCKOUT_MINUTES;
+}
+
+/**
+ * Returns the lockout expiry (datetime string) when the phone is currently
+ * locked out, else null.
+ */
+export async function checkOtpLock(db: D1Database, phone: string): Promise<string | null> {
+  try {
+    const row = await db
+      .prepare("SELECT locked_until FROM otp_lockouts WHERE phone = ? AND locked_until > datetime('now')")
+      .bind(phone)
+      .first<{ locked_until: string }>();
+    return row?.locked_until ?? null;
+  } catch (e) {
+    console.error("otp_lockouts read failed (migration_004 applied?):", e);
+    return null;
+  }
+}
+
+/** Lock the phone for `minutes` (SQL-side clock so stored values compare against datetime('now')). */
+async function lockPhone(db: D1Database, phone: string, minutes: number): Promise<void> {
+  try {
+    await db
+      .prepare(
+        `INSERT INTO otp_lockouts (phone, locked_until) VALUES (?, datetime('now', ?))
+         ON CONFLICT(phone) DO UPDATE SET locked_until = excluded.locked_until`
+      )
+      .bind(phone, `+${minutes} minutes`)
+      .run();
+  } catch (e) {
+    console.error("otp_lockouts write failed (migration_004 applied?):", e);
+  }
+}
+
+async function clearPhoneLock(db: D1Database, phone: string): Promise<void> {
+  try {
+    await db.prepare("DELETE FROM otp_lockouts WHERE phone = ?").bind(phone).run();
+  } catch (e) {
+    console.error("otp_lockouts delete failed (migration_004 applied?):", e);
+  }
+}
 
 /** True if the phone is a platform superadmin (from SUPERADMIN_PHONES secret). */
 export function isSuperadminPhone(env: AuthEnv, phone: string): boolean {
@@ -43,7 +92,7 @@ export async function requestOtp(db: D1Database, env: AuthEnv, phone: string): P
   return { ok: true, ...(env.ENV !== "production" ? { debugCode: code } : {}) };
 }
 
-export async function verifyOtp(db: D1Database, phone: string, code: string): Promise<boolean> {
+export async function verifyOtp(db: D1Database, phone: string, code: string, env?: AuthEnv): Promise<boolean> {
   const now = new Date().toISOString();
   const rows = await db
     .prepare(
@@ -57,6 +106,7 @@ export async function verifyOtp(db: D1Database, phone: string, code: string): Pr
   // Brute-force cap: burn the code after 5 failed tries so it cannot be retried.
   if (rows.attempts >= MAX_OTP_ATTEMPTS) {
     await db.prepare("UPDATE otps SET used = 1 WHERE id = ?").bind(rows.id).run();
+    await lockPhone(db, phone, otpLockoutMinutes(env));
     return false;
   }
 
@@ -65,9 +115,11 @@ export async function verifyOtp(db: D1Database, phone: string, code: string): Pr
     const attempts = rows.attempts + 1;
     await db.prepare("UPDATE otps SET attempts = ?, used = CASE WHEN ? >= ? THEN 1 ELSE used END WHERE id = ?")
       .bind(attempts, attempts, MAX_OTP_ATTEMPTS, rows.id).run();
+    if (attempts >= MAX_OTP_ATTEMPTS) await lockPhone(db, phone, otpLockoutMinutes(env));
     return false;
   }
   await db.prepare("UPDATE otps SET used = 1 WHERE id = ?").bind(rows.id).run();
+  await clearPhoneLock(db, phone);
   return true;
 }
 
