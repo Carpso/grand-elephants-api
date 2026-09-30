@@ -217,7 +217,8 @@ export async function checkDisbursementStatus(env: LipilaEnv, referenceId: strin
 
 /** Check the platform wallet balance (Grand Elephants merchant wallet). */
 export async function checkWalletBalance(env: LipilaEnv): Promise<LipilaStatus> {
-  const url = `${lipilaBase(env)}/wallet/balance`;
+  // Docs: GET /merchants/balance (the older /wallet/balance path 404s).
+  const url = `${lipilaBase(env)}/merchants/balance`;
   const res = await fetch(url, {
     headers: { accept: "application/json", "x-api-key": env.LIPILA_API_KEY },
   });

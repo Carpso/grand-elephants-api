@@ -43,6 +43,33 @@ type Ctx = Context<{ Bindings: Env }>;
 
 app.use("*", cors({ origin: "*", allowMethods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"], allowHeaders: ["Content-Type", "Authorization"] }));
 
+// ---------- maintenance mode ----------
+// When app_settings.maintenance_mode = "1", every /api/* call returns 503
+// except auth/webhooks/health/config/fx and requests from admin sessions.
+let maintenanceCache: { on: boolean; at: number } | null = null;
+const MAINT_TTL_MS = 60_000;
+
+app.use("/api/*", async (c, next) => {
+  const path = c.req.path;
+  const exempt =
+    path === "/api/config" || path === "/api/health" || path === "/api/fx" ||
+    path.startsWith("/api/auth/") || path.startsWith("/api/webhooks/");
+  if (exempt) return next();
+  const now = Date.now();
+  if (!maintenanceCache || now - maintenanceCache.at > MAINT_TTL_MS) {
+    let on = false;
+    try {
+      const row = await c.env.DB.prepare("SELECT value FROM app_settings WHERE key = 'maintenance_mode'").first<any>();
+      on = row?.value === "1";
+    } catch { on = false; }
+    maintenanceCache = { on, at: now };
+  }
+  if (!maintenanceCache.on) return next();
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw).catch(() => null);
+  if (a && hasRole(a.user, "admin", "superadmin")) return next();
+  return json(c, { error: "Maintenance in progress — please try again later." }, 503);
+});
+
 const json = (c: any, data: unknown, status = 200) => c.json(data, status);
 const badRequest = (c: any, message: string) => json(c, { error: message }, 400);
 const unauthorized = (c: any, message = "Unauthorized") => json(c, { error: message }, 401);
@@ -394,9 +421,19 @@ async function confirmOrder(db: D1Database, env: Env, orderId: string, transacti
 
 // ---------- health ----------
 
-app.get("/health", (c) => json(c, { ok: true, service: "grand-elephants-api", time: new Date().toISOString() }));
+app.get("/health", async (c) => {
+  const start = Date.now();
+  let db = "offline";
+  try { await c.env.DB.prepare("SELECT 1 AS ok").first(); db = "online"; } catch { db = "offline"; }
+  return json(c, { ok: db === "online", service: "grand-elephants-api", time: new Date().toISOString(), db, latencyMs: Date.now() - start });
+});
 // Alias: the Flutter app polls /api/health (system health modal).
-app.get("/api/health", (c) => json(c, { ok: true, service: "grand-elephants-api", time: new Date().toISOString() }));
+app.get("/api/health", async (c) => {
+  const start = Date.now();
+  let db = "offline";
+  try { await c.env.DB.prepare("SELECT 1 AS ok").first(); db = "online"; } catch { db = "offline"; }
+  return json(c, { ok: db === "online", service: "grand-elephants-api", time: new Date().toISOString(), db, latencyMs: Date.now() - start });
+});
 
 // ---------- auth ----------
 
@@ -507,6 +544,40 @@ app.get("/api/employee/stats", async (c) => {
 
 // ---------- public catalog ----------
 
+// ---------- live FX rate (USD -> ZMW) ----------
+// Free keyless trackers, tried in order; last good rate persists in app_settings.
+const FX_SOURCES = [
+  { name: "open.er-api.com", url: "https://open.er-api.com/v6/latest/USD", pick: (d: any) => Number(d?.rates?.ZMW) },
+  { name: "frankfurter", url: "https://api.frankfurter.app/latest?from=USD&to=ZMW", pick: (d: any) => Number(d?.rates?.ZMW) },
+  { name: "currency-api", url: "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json", pick: (d: any) => Number(d?.usd?.zmw) },
+];
+let fxCache: { usdToZmw: number; source: string; updatedAt: string; at: number } | null = null;
+const FX_TTL_MS = 6 * 60 * 60 * 1000;
+
+app.get("/api/fx", async (c) => {
+  const now = Date.now();
+  if (fxCache && now - fxCache.at < FX_TTL_MS) {
+    return json(c, { ok: true, usdToZmw: fxCache.usdToZmw, source: fxCache.source, updatedAt: fxCache.updatedAt, cached: true });
+  }
+  for (const s of FX_SOURCES) {
+    try {
+      const r = await fetch(s.url, { headers: { accept: "application/json" } });
+      if (!r.ok) continue;
+      const rate = s.pick(await r.json());
+      if (!Number.isFinite(rate) || rate <= 0) continue;
+      fxCache = { usdToZmw: rate, source: s.name, updatedAt: new Date().toISOString(), at: now };
+      await c.env.DB.prepare(
+        "INSERT INTO app_settings (key, value) VALUES ('fx_usd_zmw', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+      ).bind(String(rate)).run().catch(() => {});
+      return json(c, { ok: true, usdToZmw: rate, source: s.name, updatedAt: fxCache.updatedAt });
+    } catch { /* try next source */ }
+  }
+  // All sources failed: last good rate from app_settings, else static fallback.
+  const stored = await c.env.DB.prepare("SELECT value FROM app_settings WHERE key = 'fx_usd_zmw'").first<any>();
+  const rate = Number(stored?.value) || 26.5;
+  return json(c, { ok: true, usdToZmw: rate, source: stored ? "cache" : "fallback", updatedAt: null, stale: true });
+});
+
 app.get("/api/config", async (c) => {
   const cats = await c.env.DB.prepare("SELECT id, name, icon, enabled FROM categories WHERE enabled = 1 ORDER BY id").all<any>();
   const banners = await c.env.DB.prepare("SELECT id, title, subtitle, image, link FROM banners WHERE active = 1").all<any>();
@@ -516,11 +587,13 @@ app.get("/api/config", async (c) => {
   return json(c, {
     appName: byKey.app_name || "Grand Elephants",
     appSlogan: byKey.app_slogan || "Move With Conviction",
+    appDescription: byKey.app_description || "",
     appLogo: byKey.app_logo || "",
     currency: "ZMW",
     categories: (cats.results ?? []).map((r) => ({ id: String(r.id), name: r.name, icon: r.icon, enabled: r.enabled === 1 })),
     banners: banners.results ?? [],
     zraEnabled: byKey.zra_enabled === "1",
+    maintenanceMode: byKey.maintenance_mode === "1",
     feeInfo: {
       vatPct: fees.vatPct,
       commissionPct: fees.commissionPct,
@@ -1874,6 +1947,9 @@ app.patch("/api/admin/users/:id", async (c) => {
   if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const b = await body(c);
   const id = Number(c.req.param("id"));
+  if (!Number.isFinite(id)) return badRequest(c, "invalid id");
+  const target = await c.env.DB.prepare("SELECT id FROM users WHERE id = ?").bind(id).first<any>();
+  if (!target) return notFound(c, "User not found");
   const sets: string[] = [];
   const vals: unknown[] = [];
   const assignableRoles = ["user", "rider", "business", "employee", "admin"];
@@ -1971,14 +2047,23 @@ app.post("/api/admin/payouts/:id/process", async (c) => {
   if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const payout = await c.env.DB.prepare("SELECT * FROM payouts WHERE id = ?").bind(Number(c.req.param("id"))).first<any>();
   if (!payout) return notFound(c, "Payout not found");
+  if (["successful", "failed"].includes(payout.status)) return badRequest(c, `Payout is already ${payout.status}`);
   if (!payout.lipila_reference) return badRequest(c, "No Lipila reference — create a new payout");
   const res = await checkDisbursementStatus(c.env, payout.lipila_reference).catch(() => null);
   const status = res && ["success", "successful", "complete"].includes(res.status.toLowerCase())
     ? "successful"
     : res && ["failed", "error"].includes(res.status.toLowerCase()) ? "failed" : payout.status;
   await c.env.DB.prepare("UPDATE payouts SET status = ?, error = ?, updated_at = datetime('now') WHERE id = ?")
-    .bind(status, res?.message ?? null, payout.id).run();
-  return json(c, { ok: true, status });
+    .bind(status, res?.message ?? payout.error ?? null, payout.id).run();
+  if (status === "failed" && payout.status !== "failed") {
+    await c.env.DB.prepare("UPDATE wallets SET balance_cents = balance_cents + ?, updated_at = datetime('now') WHERE business_id = ?")
+      .bind(payout.amount_cents, payout.business_id).run();
+    await pushAdmins(c.env.DB, c.env, "Payout failed",
+      `Payout ${payout.lipila_reference} of K${(payout.amount_cents / 100).toFixed(2)} failed. Balance restored.`,
+      { type: "payout_failed" }).catch(() => {});
+  }
+  await logAction(c.env.DB, a.id, `payout_${status}`, "payout", String(payout.id), { status });
+  return json(c, { ok: true, status, error: res?.message ?? payout.error ?? null });
 });
 
 app.get("/api/admin/lipila-logs", async (c) => {
@@ -1993,8 +2078,12 @@ app.get("/api/admin/actions", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a) return unauthorized(c);
   if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
-  const rows = await c.env.DB.prepare("SELECT * FROM admin_actions ORDER BY id DESC LIMIT 200").all<any>();
-  return json(c, rows.results ?? []);
+  const rows = await c.env.DB.prepare(
+    `SELECT a.*, u.name AS admin_name, u.role AS admin_role
+       FROM admin_actions a LEFT JOIN users u ON u.id = a.admin_user_id
+       ORDER BY a.id DESC LIMIT 200`
+  ).all<any>();
+  return json(c, (rows.results ?? []).map((r) => ({ ...r, adminName: r.admin_name ?? null, adminRole: r.admin_role ?? null })));
 });
 
 app.get("/api/admin/invoices", async (c) => {
@@ -2032,11 +2121,18 @@ app.patch("/api/admin/settings", async (c) => {
   if (!a) return unauthorized(c);
   if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
   const b = await body(c);
+  let wrote = false;
   for (const [k, v] of Object.entries(b)) {
-    if (typeof v !== "string" && typeof v !== "number") continue;
+    let val: string | null = null;
+    if (typeof v === "string" || typeof v === "number") val = String(v);
+    else if (typeof v === "boolean") val = v ? "1" : "0";
+    if (val === null) continue;
     await c.env.DB.prepare("INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
-      .bind(k, String(v)).run();
+      .bind(k, val).run();
+    wrote = true;
+    if (k === "maintenance_mode") maintenanceCache = null;
   }
+  if (!wrote) return badRequest(c, "nothing to update");
   invalidateFeeSettings();
   await logAction(c.env.DB, a.id, "settings_updated", "settings", null, b);
   return json(c, { ok: true });
