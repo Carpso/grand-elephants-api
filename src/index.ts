@@ -151,6 +151,9 @@ async function businessScope(db: D1Database, a: { id: number; user: any }, req: 
     return biz ? Number(biz.id) : null;
   }
   if (a.user.business_id) return Number(a.user.business_id);
+  // Staff/employees are linked via business_members (their users.business_id is null).
+  const member = await db.prepare("SELECT business_id FROM business_members WHERE user_id = ?").bind(a.id).first<any>();
+  if (member) return Number(member.business_id);
   if (isAdmin) return resolveDefaultBusiness(db, a.id);
   return null;
 }
@@ -416,7 +419,8 @@ async function confirmOrder(db: D1Database, env: Env, orderId: string, transacti
     await pushNotif(db, env, owner.owner_user_id, "New confirmed order", `Order ${orderId} of ${msg.kwacha(order.total_cents)} confirmed.`, "order", { orderId });
   }
   if (env.ENV === "production" && order.customer_phone) {
-    await sendSms(env, order.customer_phone, msg.orderConfirmedSms(orderId, order.total_cents, bizName)).catch(() => {});
+    const sig = await trackingSig(env, orderId);
+    await sendSms(env, order.customer_phone, msg.orderConfirmedSms(orderId, order.total_cents, bizName, trackingUrlFor(env, orderId, sig))).catch(() => {});
   }
   return { ok: true };
 }
@@ -857,6 +861,41 @@ app.get("/api/orders/:id", async (c) => {
   return json(c, { order: await orderJson(c.env.DB, row) });
 });
 
+/** Signed tracking-link signature for one order (keyed hash — no schema change). */
+async function trackingSig(env: Env, orderId: string): Promise<string> {
+  return sha256Hex(`${env.JWT_SECRET ?? ""}:track:${orderId}`);
+}
+
+function trackingUrlFor(env: Env, orderId: string, sig: string): string {
+  const base = (env.APP_URL ?? "https://grand-elephants-api.godfreymoseskalambo.workers.dev").replace(/\/+$/, "");
+  return `${base}/#/orders/track?orderId=${encodeURIComponent(orderId)}&sig=${sig}`;
+}
+
+/** Shareable signed link for an order (buyer/rider copy it and send it to anyone). */
+app.get("/api/orders/:id/tracking-link", async (c) => {
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
+  if (!a) return unauthorized(c);
+  const row = await c.env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(c.req.param("id")).first<any>();
+  if (!row) return notFound(c, "Order not found");
+  if (!await canViewOrder(c.env.DB, a, row)) return forbidden(c, "Not your order");
+  const sig = await trackingSig(c.env, row.id);
+  return json(c, { url: trackingUrlFor(c.env, row.id, sig), sig });
+});
+
+/** Public order status for a signed tracking link (no auth; PII redacted). */
+app.get("/api/orders/:id/tracking", async (c) => {
+  const row = await c.env.DB.prepare("SELECT * FROM orders WHERE id = ?").bind(c.req.param("id")).first<any>();
+  if (!row) return notFound(c, "Order not found");
+  const sig = c.req.query("sig") ?? "";
+  const expected = await trackingSig(c.env, row.id);
+  if (!sig || sig.length !== expected.length || sig !== expected) return forbidden(c, "Invalid tracking link");
+  const t: Record<string, unknown> = { ...(await orderJson(c.env.DB, row)) };
+  // The link can be forwarded: strip PII/payment refs, keep status + items + totals.
+  for (const k of ["customerPhone", "deliveryAddress", "buyerTpin", "transactionId", "referenceId", "notes", "businessTpin", "businessAddress", "invoiceNo", "invoiceStatus"]) delete t[k];
+  t.trackingUrl = trackingUrlFor(c.env, row.id, expected);
+  return json(c, { order: t });
+});
+
 /**
  * Printable receipt for one order (same access rule as GET /api/orders/:id).
  * Response: { receipt: { orderNumber, invoiceNo, status, paymentMethod,
@@ -953,9 +992,12 @@ app.post("/api/businesses/apply", async (c) => {
 app.get("/api/businesses/me", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a) return unauthorized(c);
-  if (!a.user.business_id) return notFound(c, "No business");
-  const b = await getBusiness(c.env.DB, a.user.business_id);
-  if (!b) return notFound(c, "No business");
+  // Admins/superadmins without their own shop fall back to the platform business
+  // (Grand Elephants) instead of erroring — see businessScope().
+  const businessId = await businessScope(c.env.DB, a);
+  if (!businessId) return notFound(c, "No business yet — apply to become a seller");
+  const b = await getBusiness(c.env.DB, businessId);
+  if (!b) return notFound(c, "No business yet — apply to become a seller");
   const wallet = await c.env.DB.prepare("SELECT * FROM wallets WHERE business_id = ?").bind(b.id).first<any>();
   const numbers = await c.env.DB.prepare("SELECT * FROM collection_numbers WHERE business_id = ? ORDER BY is_default DESC").bind(b.id).all<any>();
   const staff = await c.env.DB.prepare(
@@ -993,7 +1035,8 @@ app.get("/api/businesses/:id", async (c) => {
 app.put("/api/businesses/me", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a) return unauthorized(c);
-  if (!a.user.business_id) return forbidden(c);
+  const businessId = await businessScope(c.env.DB, a);
+  if (!businessId) return forbidden(c, "No business yet — apply to become a seller");
   const b = await body(c);
   const sets: string[] = [];
   const vals: unknown[] = [];
@@ -1001,7 +1044,7 @@ app.put("/api/businesses/me", async (c) => {
     if (b[field] !== undefined) { sets.push(`${col} = ?`); vals.push(String(b[field])); }
   }
   if (!sets.length) return badRequest(c, "nothing to update");
-  vals.push(a.user.business_id);
+  vals.push(businessId);
   await c.env.DB.prepare(`UPDATE businesses SET ${sets.join(", ")}, updated_at = datetime('now') WHERE id = ?`).bind(...vals).run();
   return json(c, { ok: true });
 });
@@ -1137,10 +1180,11 @@ app.delete("/api/businesses/me/products/:id", async (c) => {
 app.get("/api/businesses/me/orders", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a) return unauthorized(c);
-  if (!a.user.business_id) return forbidden(c);
+  const businessId = await businessScope(c.env.DB, a);
+  if (!businessId) return forbidden(c, "No business yet — apply to become a seller");
   const { status } = c.req.query();
   let sql = "SELECT * FROM orders WHERE business_id = ?";
-  const vals: unknown[] = [a.user.business_id];
+  const vals: unknown[] = [businessId];
   if (status) { sql += " AND status = ?"; vals.push(status); }
   sql += " ORDER BY created_at DESC LIMIT 200";
   const rows = await c.env.DB.prepare(sql).bind(...vals).all<any>();
@@ -1180,7 +1224,8 @@ app.post("/api/businesses/me/orders/:id/status", async (c) => {
   await pushNotif(c.env.DB, c.env, order.user_id, "Order update", `Order ${order.id} is now ${status}.`, "order", { orderId: order.id });
   const biz = await getBusiness(c.env.DB, order.business_id);
   if (envV(c, "ENV", "sandbox") === "production" && order.customer_phone) {
-    await sendSms(c.env, order.customer_phone, msg.orderStatusSms(order.id, status, biz?.name ?? "")).catch(() => {});
+    const sig = await trackingSig(c.env, order.id);
+    await sendSms(c.env, order.customer_phone, msg.orderStatusSms(order.id, status, biz?.name ?? "", trackingUrlFor(c.env, order.id, sig))).catch(() => {});
   }
   const riderRow = order.rider_id ? await c.env.DB.prepare("SELECT user_id FROM riders WHERE id = ?").bind(order.rider_id).first<any>() : null;
   if (riderRow && status === "Delivered") {
@@ -1194,7 +1239,8 @@ app.post("/api/businesses/me/orders/:id/status", async (c) => {
 app.post("/api/businesses/me/staff", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a) return unauthorized(c);
-  if (!a.user.business_id) return forbidden(c);
+  const businessId = await businessScope(c.env.DB, a);
+  if (!businessId) return forbidden(c, "No business yet — apply to become a seller");
   const b = await body(c);
   const phone = normPhone(b.phone ?? "");
   if (!phone) return badRequest(c, "phone is required");
@@ -1205,11 +1251,11 @@ app.post("/api/businesses/me/staff", async (c) => {
     staff = await c.env.DB.prepare("SELECT * FROM users WHERE id = ?").bind(r.meta.last_row_id).first<any>();
   }
   await c.env.DB.prepare("INSERT OR IGNORE INTO business_members (business_id, user_id, role_in_business) VALUES (?, ?, ?)")
-    .bind(a.user.business_id, staff.id, b.roleInBusiness ?? "staff").run();
+    .bind(businessId, staff.id, b.roleInBusiness ?? "staff").run();
   if (staff.role === "user") {
     await c.env.DB.prepare("UPDATE users SET role = 'employee', updated_at = datetime('now') WHERE id = ?").bind(staff.id).run();
   }
-  const biz = await getBusiness(c.env.DB, a.user.business_id);
+  const biz = await getBusiness(c.env.DB, businessId);
   await pushNotif(c.env.DB, c.env, staff.id, "Team invitation", `You have been added to ${biz?.name ?? "a shop"} as staff.`, "business").catch(() => {});
   return json(c, { ok: true, userId: String(staff.id) }, 201);
 });
@@ -1219,8 +1265,9 @@ app.post("/api/businesses/me/staff", async (c) => {
 app.get("/api/businesses/me/riders", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a) return unauthorized(c);
-  if (!a.user.business_id) return forbidden(c);
-  const rows = await c.env.DB.prepare("SELECT * FROM riders WHERE business_id = ? ORDER BY status, joined DESC").bind(a.user.business_id).all<any>();
+  const businessId = await businessScope(c.env.DB, a);
+  if (!businessId) return forbidden(c, "No business yet — apply to become a seller");
+  const rows = await c.env.DB.prepare("SELECT * FROM riders WHERE business_id = ? ORDER BY status, joined DESC").bind(businessId).all<any>();
   return json(c, (rows.results ?? []).map((r) => ({
     id: String(r.id), userId: String(r.user_id), name: r.name, phone: r.phone, vehicle: r.vehicle,
     status: r.status, balance: r.balance_cents / 100, balanceCents: r.balance_cents, joined: r.joined,
@@ -1230,7 +1277,8 @@ app.get("/api/businesses/me/riders", async (c) => {
 app.post("/api/businesses/me/riders", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a) return unauthorized(c);
-  if (!a.user.business_id) return forbidden(c);
+  const businessId = await businessScope(c.env.DB, a);
+  if (!businessId) return forbidden(c, "No business yet — apply to become a seller");
   const b = await body(c);
   const phone = normPhone(b.phone ?? "");
   if (!phone) return badRequest(c, "phone is required");
@@ -1243,8 +1291,8 @@ app.post("/api/businesses/me/riders", async (c) => {
     await c.env.DB.prepare("UPDATE users SET role = 'rider', rider_status = 'approved', updated_at = datetime('now') WHERE id = ?").bind(riderUser.id).run();
   }
   await c.env.DB.prepare("INSERT OR IGNORE INTO riders (user_id, business_id, name, phone, vehicle, status) VALUES (?, ?, ?, ?, ?, 'approved')")
-    .bind(riderUser.id, a.user.business_id, b.name ?? riderUser.name, phone, b.vehicle ?? "").run();
-  const biz = await getBusiness(c.env.DB, a.user.business_id);
+    .bind(riderUser.id, businessId, b.name ?? riderUser.name, phone, b.vehicle ?? "").run();
+  const biz = await getBusiness(c.env.DB, businessId);
   await pushNotif(c.env.DB, c.env, riderUser.id, "You are now a rider", `You can deliver for ${biz?.name ?? "the marketplace"}.`, "rider").catch(() => {});
   return json(c, { ok: true }, 201);
 });
@@ -1252,11 +1300,12 @@ app.post("/api/businesses/me/riders", async (c) => {
 app.post("/api/businesses/me/riders/:id/status", async (c) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a) return unauthorized(c);
-  if (!a.user.business_id) return forbidden(c);
+  const businessId = await businessScope(c.env.DB, a);
+  if (!businessId) return forbidden(c, "No business yet — apply to become a seller");
   const b = await body(c);
   if (!["approved", "suspended"].includes(b.status)) return badRequest(c, "status must be approved or suspended");
   await c.env.DB.prepare("UPDATE riders SET status = ?, updated_at = datetime('now') WHERE id = ? AND business_id = ?")
-    .bind(b.status, Number(c.req.param("id")), a.user.business_id).run();
+    .bind(b.status, Number(c.req.param("id")), businessId).run();
   return json(c, { ok: true });
 });
 
@@ -1630,10 +1679,11 @@ app.get("/api/admin/lipila/balance", async (c) => {
 const businessPayoutHandler = async (c: Ctx) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a) return unauthorized(c);
-  if (!a.user.business_id) return forbidden(c);
-  const wallet = await c.env.DB.prepare("SELECT * FROM wallets WHERE business_id = ?").bind(a.user.business_id).first<any>();
+  const businessId = await businessScope(c.env.DB, a);
+  if (!businessId) return forbidden(c, "No business yet — apply to become a seller");
+  const wallet = await c.env.DB.prepare("SELECT * FROM wallets WHERE business_id = ?").bind(businessId).first<any>();
   if (!wallet || wallet.balance_cents < 5000) return badRequest(c, "Minimum payout is K50");
-  const numbers = await c.env.DB.prepare("SELECT * FROM collection_numbers WHERE business_id = ? AND is_active = 1 ORDER BY is_default DESC").bind(a.user.business_id).first<any>();
+  const numbers = await c.env.DB.prepare("SELECT * FROM collection_numbers WHERE business_id = ? AND is_active = 1 ORDER BY is_default DESC").bind(businessId).first<any>();
   if (!numbers) return badRequest(c, "Add a collection number first");
 
   const amountCents = wallet.balance_cents;
@@ -1642,13 +1692,13 @@ const businessPayoutHandler = async (c: Ctx) => {
   const r = await c.env.DB.prepare(
     `INSERT INTO payouts (business_id, amount_cents, fee_cents, net_cents, phone, network, status, requested_by)
      VALUES (?, ?, ?, ?, ?, ?, 'processing', ?)`
-  ).bind(a.user.business_id, amountCents, amountCents - netCents, netCents, numbers.phone_number, numbers.network, a.id).run();
+  ).bind(businessId, amountCents, amountCents - netCents, netCents, numbers.phone_number, numbers.network, a.id).run();
   const payoutId = r.meta.last_row_id;
-  await c.env.DB.prepare("UPDATE wallets SET balance_cents = 0, updated_at = datetime('now') WHERE business_id = ?").bind(a.user.business_id).run();
+  await c.env.DB.prepare("UPDATE wallets SET balance_cents = 0, updated_at = datetime('now') WHERE business_id = ?").bind(businessId).run();
 
   const referenceId = `PAY-${payoutId}-${String(Date.now()).slice(-6)}`;
   const callbackUrl = `${envV(c, "APP_URL", "https://grand-elephants-api.godfreymoseskalambo.workers.dev")}/api/webhooks/lipila`;
-  const biz = await getBusiness(c.env.DB, a.user.business_id);
+  const biz = await getBusiness(c.env.DB, businessId);
   try {
     const res = await createDisbursement(c.env, {
       referenceId,
@@ -1663,7 +1713,7 @@ const businessPayoutHandler = async (c: Ctx) => {
     await c.env.DB.prepare("UPDATE payouts SET status = 'failed', error = ?, updated_at = datetime('now') WHERE id = ?")
       .bind(String(e.message ?? e).slice(0, 500), payoutId).run();
     await c.env.DB.prepare("UPDATE wallets SET balance_cents = balance_cents + ?, updated_at = datetime('now') WHERE business_id = ?")
-      .bind(amountCents, a.user.business_id).run();
+      .bind(amountCents, businessId).run();
     return json(c, { ok: false, error: "Payout failed. Balance restored.", detail: String(e.message ?? e).slice(0, 200) }, 502);
   }
   if (envV(c, "ENV", "sandbox") === "production") {
@@ -1679,8 +1729,9 @@ app.post("/api/businesses/me/payouts", businessPayoutHandler);
 const businessPayoutListHandler = async (c: Ctx) => {
   const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
   if (!a) return unauthorized(c);
-  if (!a.user.business_id) return forbidden(c);
-  const rows = await c.env.DB.prepare("SELECT * FROM payouts WHERE business_id = ? ORDER BY created_at DESC LIMIT 50").bind(a.user.business_id).all<any>();
+  const businessId = await businessScope(c.env.DB, a);
+  if (!businessId) return forbidden(c, "No business yet — apply to become a seller");
+  const rows = await c.env.DB.prepare("SELECT * FROM payouts WHERE business_id = ? ORDER BY created_at DESC LIMIT 50").bind(businessId).all<any>();
   return json(c, (rows.results ?? []).map((p) => ({
     id: String(p.id), amount: p.amount_cents / 100, amountCents: p.amount_cents,
     fee: p.fee_cents / 100, feeCents: p.fee_cents, net: p.net_cents / 100, netCents: p.net_cents,
@@ -1947,6 +1998,32 @@ app.get("/api/admin/users", async (c) => {
   sql += " ORDER BY id DESC LIMIT 200";
   const rows = await c.env.DB.prepare(sql).bind(...vals).all<any>();
   return json(c, (rows.results ?? []).map(userJson));
+});
+
+/** Create a user by phone number (superadmin/admin adding an admin). The person
+ * keeps the seeded role through OTP login — verify-otp never touches `role`. */
+app.post("/api/admin/users", async (c) => {
+  const a = await authFromRequest(c.env.DB, c.env, c.req.raw);
+  if (!a) return unauthorized(c);
+  if (!hasRole(a.user, "admin", "superadmin")) return forbidden(c);
+  const b = await body(c);
+  const phone = normPhone(b.phone ?? "");
+  if (!phone) return badRequest(c, "phone is required");
+  const role = b.role === undefined ? "admin" : String(b.role);
+  if (role === "superadmin") {
+    if (a.user.role !== "superadmin") return json(c, { error: "Only a superadmin can grant superadmin" }, 403);
+  } else if (!["user", "rider", "business", "employee", "admin"].includes(role)) {
+    return badRequest(c, "invalid role");
+  }
+  const existing = await c.env.DB.prepare("SELECT id, role FROM users WHERE phone = ?").bind(phone).first<any>();
+  if (existing) return json(c, { error: "A user with this phone number already exists — use Change Role instead", existingUserId: String(existing.id) }, 409);
+  const name = b.name === undefined ? "" : String(b.name).slice(0, 120);
+  const r = await c.env.DB.prepare("INSERT INTO users (uid, name, phone, role) VALUES (?, ?, ?, ?)")
+    .bind(`u_${randomHex(8)}`, name, phone, role).run();
+  const userId = Number(r.meta.last_row_id);
+  await logAction(c.env.DB, a.id, "user_created", "user", String(userId), { phone, role });
+  await sendSms(c.env, phone, msg.inviteSms(name, role)).catch(() => {});
+  return json(c, { ok: true, userId: String(userId), role }, 201);
 });
 
 app.patch("/api/admin/users/:id", async (c) => {
