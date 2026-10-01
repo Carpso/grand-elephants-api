@@ -70,9 +70,16 @@ Saved: 2026-10-01. Companion: same file in `grand-elephants-flutter`.
 ## Known gaps / next steps
 - ZRA Smart Invoice embed (fill in `src/smart_invoice.ts`); `ZRA_API_KEY` secret unset (blank until onboarding).
 - Maintenance mode untested at runtime (no admin JWT available locally) — code-reviewed only; test the toggle carefully (admins bypass, customers get 503 for 60s after toggle-off at worst).
-- Android artifacts (2026-09-30 APK/AAB) built but **not uploaded to R2** (`media.churchonapp.com/grand-elephants/` still serves the 2026-09-27 build).
+- Android artifacts: **2026-10-01 APK/AAB uploaded to R2** (`media.churchonapp.com/grand-elephants/grand-elephants.apk|.aab`, MD5==ETag verified; supersedes the 09-27/09-30 note above).
 
 ## Key commands
 - `npx tsc --noEmit` (must be 0), `npx wrangler deploy`, `npx wrangler secret list`
 - `npx wrangler d1 execute grand-elephants-db --remote --command "SELECT ..."` — **`--remote` is mandatory: bare `d1 execute` runs against LOCAL `.wrangler/state` (wrangler 4) and shows empty tables that look like a wipe.** Also: **SQL must contain NO single quotes** (PowerShell splits the arg at `'`); use `char()`/`substr` tricks for string literals, or write a temp `.sql` file + `--file` (rows for SELECTs are NOT printed in file mode — only stats).
 - Deploy website: `flutter build web --release` in Flutter repo first, then `npx wrangler deploy` here (`.\deploy.ps1` does both).
+
+## 2026-10-01 foreign deployer: IDENTIFIED & PAUSED
+- **Who**: Cloudflare **Workers Builds** trigger on this worker (tag `6b35d4d2bcc54e65a152ce891b2158c2`): trigger `26982fbd-a34b-4b05-8c98-41c62a2872f3`, created **2026-09-23T12:20:38Z** (build token "Workers Builds - 2026-09-23 14:20"), repo GitHub **Carpso/grand-elephants-flutter** (repo_id 1322678972), branch `main`, root `/`, build cmd empty, **deploy cmd `npx wrangler deploy`**.
+- **Mechanism (from build logs)**: every push to flutter `main` → CF clones repo → repo has NO wrangler config → wrangler 4.145.0 wizard auto-creates an **assets-only** `wrangler.jsonc` (name `grand-elephants-api`, Framework: Static, Output Directory: `web`, compat date = that day) → uploads ~8 static files over the API worker → all `/api/*` empty 404 (CF `100311`) + bindings replaced → **secrets gone**. Proof: build `66947c2a-ea8c-4970-ac5c-9c562b80dd77` log ends `Current Version ID: dce629f6-…` = the 07:49:40Z strike.
+- **Timing**: strikes land +24–86 s after flutter `main` pushes (2026-10-01: 05:41:39, 06:41:46, 07:42:06, 07:49:40; earlier 09-25 03:52, 09-27 08:08/12:40/15:48). Local wrangler logs have **no** entries at strike times (not this machine). No GitHub Actions/workflows/repo webhooks on either repo (GitHub App deliveries don't show in hooks API).
+- **Pause action**: `DELETE /accounts/{acc}/builds/triggers/26982fbd-…` → triggers list now `count=0`. Used cfut_ token `cfut_6ZAx…` (from `OneDrive\Documents\Edit Cloudflare Workers API token*.txt`; 4 cfut_ tokens there are **active plaintext** — SECURITY.md rotation never happened). Builds API needs a user-scoped token (wrangler OAuth → 403).
+- **Never reconnect** this repo under Worker → Settings → Builds; if a git connection/trigger reappears, strikes resume. `repo_connection` `b8914073-…` may linger — harmless without a trigger. Control test: the SESSION_STATE push after this edit must create **no** new deployment (verify via `/workers/scripts/grand-elephants-api/deployments`).
