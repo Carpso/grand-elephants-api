@@ -1,4 +1,4 @@
-// FCM push via firebase-admin (adapted from Kingdom Sponsor, projectId from env).
+// FCM push via firebase-admin (projectId from env).
 import { getApps, initializeApp, cert, App } from "firebase-admin/app";
 import { getMessaging, Messaging } from "firebase-admin/messaging";
 

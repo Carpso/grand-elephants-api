@@ -1,4 +1,4 @@
-// Minimal HS256 JWT using Web Crypto (no dependencies). Copied from Kingdom Sponsor.
+// Minimal HS256 JWT using Web Crypto (no dependencies).
 
 const enc = new TextEncoder();
 

@@ -1,4 +1,6 @@
-// Lipila payment gateway client (server-side, copied from Kingdom Sponsor).
+// Lipila payment gateway client (server-side). Payments settle to the Grand
+// Elephants wallet: LIPILA_API_KEY = GE merchant (wallet code 98462), and the
+// project's own webhook secret — never another project's credentials.
 // Docs: https://docs.lipila.dev
 // Sandbox API: https://api.lipila.dev/api/v1   Production API: https://blz.lipila.io/api/v1
 
