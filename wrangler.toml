@@ -45,8 +45,13 @@ LIPILA_ENV = "production"       # Lipila gateway: "sandbox" (api.lipila.dev) or 
 APP_URL = "https://grand-elephants-api.godfreymoseskalambo.workers.dev"
 FIREBASE_PROJECT_ID = "grand-elephants-b8ec4"
 CORS_ORIGINS = "https://grand-elephants-api.godfreymoseskalambo.workers.dev"
-# Fees (cents / percent - see src/fees.ts)
-PLATFORM_COMMISSION_PCT = "15"    # marketplace commission per order (business pays)
+# Fees (cents / percent - see src/fees.ts). Buyer pays platform cut + Lipila
+# fee on top of the order; tenant keeps 100% of the goods subtotal.
+PLATFORM_COMMISSION_PCT = "1"       # platform cut % on MoMo payments (buyer pays, min below)
+PLATFORM_MIN_FEE_CENTS = "300"      # minimum MoMo buyer fee (K3)
+PLATFORM_CARD_FEE_PCT = "2"         # platform cut % on card payments (buyer pays)
+PLATFORM_CARD_MIN_FEE_CENTS = "500" # minimum card buyer fee (K5)
+PLATFORM_PAYOUT_FEE_PCT = "1"       # platform cut % on payouts (min K3)
 DELIVERY_BASE_FEE_CENTS = "2500"  # K25 base delivery fee
 DELIVERY_PER_KM_CENTS = "1000"    # K10 per km
 VAT_PCT = "16"                    # ZRA VAT on goods

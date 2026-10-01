@@ -126,6 +126,7 @@ CREATE TABLE orders (
   delivery_fee_cents INTEGER NOT NULL DEFAULT 0,
   vat_cents INTEGER NOT NULL DEFAULT 0,
   total_cents INTEGER NOT NULL,
+  platform_fee_cents INTEGER NOT NULL DEFAULT 0, -- platform's buyer-borne fee on this order (stats)
   status TEXT NOT NULL DEFAULT 'Pending',   -- Pending|Confirmed|Processing|Shipped|Out for Delivery|Delivered|Cancelled|Refunded
   payment_method TEXT NOT NULL DEFAULT 'mobile_money', -- mobile_money | card
   payment_status TEXT NOT NULL DEFAULT 'pending',      -- pending | successful | failed

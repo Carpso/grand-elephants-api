@@ -26,6 +26,10 @@ type Env = AuthEnv &
     CORS_ORIGINS?: string;
     VAT_PCT?: string;
     PLATFORM_COMMISSION_PCT?: string;
+    PLATFORM_MIN_FEE_CENTS?: string;
+    PLATFORM_CARD_FEE_PCT?: string;
+    PLATFORM_CARD_MIN_FEE_CENTS?: string;
+    PLATFORM_PAYOUT_FEE_PCT?: string;
     DELIVERY_BASE_FEE_CENTS?: string;
     DELIVERY_PER_KM_CENTS?: string;
     LIPILA_COLLECTION_FEE_PCT?: string;
@@ -155,6 +159,8 @@ async function businessScope(db: D1Database, a: { id: number; user: any }, req: 
 function feeEnvRaw(env: Env): Record<string, string | undefined> {
   return {
     VAT_PCT: env.VAT_PCT, PLATFORM_COMMISSION_PCT: env.PLATFORM_COMMISSION_PCT,
+    PLATFORM_MIN_FEE_CENTS: env.PLATFORM_MIN_FEE_CENTS, PLATFORM_CARD_FEE_PCT: env.PLATFORM_CARD_FEE_PCT,
+    PLATFORM_CARD_MIN_FEE_CENTS: env.PLATFORM_CARD_MIN_FEE_CENTS, PLATFORM_PAYOUT_FEE_PCT: env.PLATFORM_PAYOUT_FEE_PCT,
     DELIVERY_BASE_FEE_CENTS: env.DELIVERY_BASE_FEE_CENTS, DELIVERY_PER_KM_CENTS: env.DELIVERY_PER_KM_CENTS,
     LIPILA_COLLECTION_FEE_PCT: env.LIPILA_COLLECTION_FEE_PCT,
     LIPILA_DISBURSEMENT_FEE_PCT: env.LIPILA_DISBURSEMENT_FEE_PCT,
@@ -162,14 +168,10 @@ function feeEnvRaw(env: Env): Record<string, string | undefined> {
   };
 }
 
-async function feesOf(env: Env, db: D1Database, businessId?: number): Promise<{ feeSettings: FeeSettings; commissionPct: number }> {
+async function feesOf(env: Env, db: D1Database): Promise<{ feeSettings: FeeSettings; commissionPct: number }> {
   const feeSettings = await loadFeeSettings(db, feeEnvRaw(env));
-  let commissionPct = feeSettings.commissionPct;
-  if (businessId) {
-    const b = await getBusiness(db, businessId);
-    if (b?.commission_pct != null) commissionPct = Number(b.commission_pct);
-  }
-  return { feeSettings, commissionPct };
+  // The platform cut is uniform across tenants (per-business commission retired).
+  return { feeSettings, commissionPct: feeSettings.commissionPct };
 }
 
 function productJson(row: any): Record<string, unknown> {
@@ -333,8 +335,8 @@ async function confirmOrder(db: D1Database, env: Env, orderId: string, transacti
 
   const biz = await getBusiness(db, order.business_id);
   const feeSettings = await loadFeeSettings(db, feeEnvRaw(env));
-  const commissionPct = biz?.commission_pct != null ? Number(biz.commission_pct) : feeSettings.commissionPct;
-  const goodsShare = order.subtotal_cents - Math.round(order.subtotal_cents * (commissionPct / 100));
+  // Tenant keeps 100% of the goods subtotal (the buyer paid the platform fee on top).
+  const goodsShare = order.subtotal_cents;
 
   await db.batch([
     db.prepare("UPDATE orders SET payment_status = 'successful', transaction_id = ?, status = 'Confirmed', updated_at = datetime('now') WHERE id = ?")
@@ -599,6 +601,13 @@ app.get("/api/config", async (c) => {
       commissionPct: fees.commissionPct,
       deliveryBaseFeeCents: fees.deliveryBaseFeeCents,
       deliveryPerKmCents: fees.deliveryPerKmCents,
+      // Buyer payment fee (platform cut + Lipila processor fee), with minimums.
+      momoFeePct: fees.commissionPct + fees.lipilaCollectionFeePct,
+      momoFeeMinCents: fees.platformMinFeeCents,
+      cardFeePct: fees.cardPlatformPct + fees.cardLipilaCollectionFeePct,
+      cardFeeMinCents: fees.cardPlatformMinFeeCents,
+      payoutFeePct: fees.payoutPlatformPct,
+      payoutFeeMinCents: fees.platformMinFeeCents,
     },
   });
 });
@@ -758,21 +767,20 @@ app.post("/api/orders", async (c) => {
 
   const deliveryKm = Math.min(50, Math.max(0, Number(b.deliveryKm) || 0));
   const paymentMethod = b.paymentMethod === "card" ? "card" : "mobile_money";
-  const { feeSettings, commissionPct } = await feesOf(c.env, c.env.DB, businessId);
+  const { feeSettings } = await feesOf(c.env, c.env.DB);
   const totals = computeOrderTotals(feeSettings, {
     items: normalized.map((n) => ({ priceCents: n.priceCents, quantity: n.quantity })),
     deliveryKm,
     paymentMethod,
-    businessCommissionPct: commissionPct,
   });
 
   const orderId = makeOrderId();
   await c.env.DB.batch([
     c.env.DB.prepare(
-      `INSERT INTO orders (id, user_id, business_id, subtotal_cents, delivery_fee_cents, vat_cents, total_cents, status, payment_method, payment_status,
+      `INSERT INTO orders (id, user_id, business_id, subtotal_cents, delivery_fee_cents, vat_cents, total_cents, platform_fee_cents, status, payment_method, payment_status,
         delivery_address, delivery_method, customer_phone, notes, reference_id, buyer_tpin)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', ?, 'pending', ?, ?, ?, ?, ?, ?)`
-    ).bind(orderId, a.id, businessId, totals.subtotalCents, totals.deliveryFeeCents, totals.vatCents, totals.totalCents,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?, 'pending', ?, ?, ?, ?, ?, ?)`
+    ).bind(orderId, a.id, businessId, totals.subtotalCents, totals.deliveryFeeCents, totals.vatCents, totals.totalCents, totals.platformFeeCents,
       paymentMethod, b.deliveryAddress ?? "", b.deliveryMethod ?? "standard", normPhone(b.customerPhone ?? a.user.phone), b.notes ?? null, orderId,
       buyerTpin || null),
     ...normalized.map((n) => c.env.DB.prepare(
@@ -1918,7 +1926,7 @@ app.get("/api/admin/stats", async (c) => {
     c.env.DB.prepare("SELECT COALESCE(SUM(balance_cents),0) AS bal FROM wallets").first<any>(),
   ]);
   const revenue = await c.env.DB.prepare(
-    `SELECT COALESCE(SUM(o.subtotal_cents * b.commission_pct / 100), 0) AS commission FROM orders o JOIN businesses b ON b.id = o.business_id WHERE o.payment_status = 'successful'`
+    `SELECT COALESCE(SUM(platform_fee_cents), 0) AS commission FROM orders WHERE payment_status = 'successful'`
   ).first<any>();
   return json(c, {
     users: users?.n ?? 0, businesses: businesses?.n ?? 0, orders: orders?.n ?? 0,
